@@ -12,6 +12,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 import numpy as np
 
 # Default libraries
+import argparse
 from typing import Union, List, Dict
 
 class PromptLogitProcessor:
@@ -88,12 +89,12 @@ class HF_Interface():
                                                   )
 
     def generate_text_and_logits(self,
-                                 input_text: str, # Prompt as human-given plaintext
+                                 prompt_: Union[str,Dict[str,str],List[Dict[str,str]]], # Prompt as human-given plaintext
                                  generation_config: GenerationConfig,
                                  logits_processor = None, # Given to alter logits during generation
                                  ):
         # Prepare the input
-        prompt = self.chat_format_prompt(input_text)
+        prompt = self.chat_format_prompt(prompt_)
         # Tokenize the input
         inputs = self.tokenizer(prompt, return_tensors="pt")
 
@@ -120,51 +121,108 @@ class HF_Interface():
         logit_values = [[token_logits[0][idx].item() for idx in positions] \
                         for (token_logits,positions) in zip(output_ids.to_tuple()[1],token_positions)]
         # Lookup has the vocab word for each non-infinite value in the logits
+        # TODO: Reorder token positions based on logit value (greatest-to-least)
         lookup = [[vk[k] for k in pos] for pos in token_positions]
         # Argmax == greedy sampling which may not represent the generator's
         # sampling technique -- use `generation_config` to customize that behavior
         highlight = [np.argmax(tid_list) for tid_list in logit_values]
         # Reverse-engineer what highlight SHOULD look like based on the generated text?
+        print("\n".join([str(_) for _ in lookup]))
+        print(highlight)
 
         return generated_text
 
 # Main function to tie everything together
-def main(model_name: str, input_text: str, seeds: list, generation_config: GenerationConfig):
-    hfi = HF_Interface(model_name)
+def main(model_name: str,
+         prompt: Union[str,Dict[str,str],List[Dict[str,str]]],
+         seeds: list,
+         generation_config: GenerationConfig,
+         model: HF_Interface = None):
+    if model is None:
+        model = HF_Interface(model_name)
 
     for seed in seeds:
         print(f"Generating text with seed: {seed}")
-        hfi.set_seed(seed)
+        model.set_seed(seed)
 
         # Generate text and logits
-        generated_text = hfi.generate_text_and_logits(input_text,
-                                                      generation_config,
-                                                      None, # No logit processing yet
-                                                      )
+        generated_text = model.generate_text_and_logits(prompt,
+                                                        generation_config,
+                                                        None, # No logit processing yet
+                                                        )
         print(f"Generated Text with seed {seed}:\n{generated_text}")
 
+def build():
+    default_help = "(default: %(default)s)"
+    prs = argparse.ArgumentParser()
+    prs.add_argument("--input", type=str, default=None,
+                     help=f"Prompt text for the model")
+    prs.add_argument("--input-from-file", action='store_true',
+                     help=f"Indicates the --input argument is a file to be read {default_help}")
+    prs.add_argument("--system-prompt", type=str, default=None,
+                     help=f"System prompt for the model")
+    prs.add_argument("--system-prompt-from-file", action='store_true',
+                     help=f"Indicates the --system-prompt argument is a file to be read {default_help}")
+    prs.add_argument("--seeds", type=int, default=None, action='append', nargs="+",
+                     required=True, help="RNG seeds for generation")
+    prs.add_argument("--model-name", type=str, default="meta-llama/Llama-3.1-8B-Instruct",
+                     help=f"HuggingFace model to load {default_help}")
+    gen_config = prs.add_argument_group("Generation Configuration")
+    gen_config.add_argument("--temperature", type=float, default=0.7,
+                            help=f"Softmax sharpening in [0,1] {default_help}")
+    gen_config.add_argument("--top-p", type=float, default=0.95,
+                            help=f"Limit sampling to top-% proportion by probability {default_help}")
+    gen_config.add_argument("--top-k", type=int, default=0,
+                            help=f"Limit sampling to top-N tokens; typically 0 to disable and use other means {default_help}")
+    gen_config.add_argument("--num-beams", type=int, default=1,
+                            help=f"Number of beams in beam search (1=no beam search) {default_help}")
+    gen_config.add_argument("--greedy-sample", action='store_true',
+                            help=f"Reduce sampling variation by greedy token search {default_help}")
+    gen_config.add_argument("--max-new-tokens", type=int, default=50,
+                            help=f"Number of new tokens permitted in response {default_help}")
+    gen_config.add_argument("--num-return-sequences", type=int, default=1,
+                            help=f"When doing beam-search, number of decoding sequences to return {default_help}")
+    return prs
+
+def parse(args=None, prs=None, prs_extend_fn=None):
+    if prs is None:
+        prs = build()
+    if prs_extend_fn is not None:
+        prs = prs_extend_fn(prs)
+    if args is None:
+        args = prs.parse_args()
+    # Adjust generation config
+    args.gen_config = GenerationConfig(
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            num_beams=args.num_beams,
+            early_stopping=args.num_beams>1,
+            do_sample=not args.greedy_sample,
+            max_new_tokens=args.max_new_tokens,
+            num_return_sequences=args.num_return_sequences,
+            seed=None, # Overridden in HFI's generation wrapper
+            )
+    # Flatten args.seeds
+    args.seeds = np.asarray(args.seeds).ravel()
+    if args.input is None:
+        args.input = "Once upon a time, in a distant land, there was a mysterious forest."
+    elif args.input_from_file:
+        with open(args.input,'r') as f:
+            args.input = "".join(f.readlines())
+    if args.system_prompt is not None:
+        if args.system_prompt_from_file:
+            with open(args.system_prompt,'r') as f:
+                args.system_prompt = "".join(f.readlines())
+        args.input = [{'role': 'system', 'content': args.system_prompt},
+                      {'role': 'user', 'content': args.input}]
+    return args
+
 if __name__ == "__main__":
-    # TODO: All of this stuff should really be in argparse
-    # Parameters
-    model_name = "meta-llama/Llama-3.1-8B-Instruct"  # Replace with your desired model
-    input_text = "Once upon a time, in a distant land, there was a mysterious forest."
-    seeds = [10648, 12345, 78910]  # Example seeds for varying outputs
-    generation_config = GenerationConfig(
-        temperature=0.7, # Softmax sharpening
-        top_k=0, # Limit sampling to top-N candidate tokens; deactivated in most sampling regimes
-        top_p=0.95, # Limit sampling to top-F proportion of probability
-        num_beams=1,  # You can adjust this for different types of beam search
-        # Leaving n_beams=1 is greedy, n_beams > 1 permits multiple hypotheses
-        # to be evaluated and it picks the most likely FULL sequence at the end
-        # If you set multiple beams, make sure to also set:
-        #early_stopping=True,
-        do_sample=True,  # Ensures randomness, set to False for greedy search
-        max_new_tokens=50, # Adjust this as needed to permit/deny yapping
-        num_return_sequences=1, # When doing beam-search etc, how many decoding sequences to return
-        seed=None  # You can leave this out, as we handle the seed manually in HFI's generation wrapper
-    )
-    print(generation_config)
+    # CLI
+    args = parse()
+    print(args.gen_config)
 
     # Run the script
-    main(model_name, input_text, seeds, generation_config)
+    main(args.model_name, args.input, args.seeds, args.gen_config)
 
