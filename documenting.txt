@@ -1,0 +1,2 @@
+python3 dataset_to_llm_format.py --in ~/ANL_22/ytopt_tlranda/ytopt/benchmark/syr2k_exp/data/results_rf_{l,m,s}_syr2k.csv --out training_data.csv --drop elapsed_sec --remap "p0:outer_loop_array_packed" "p1:middle_loop_array_packed" "p2:inner_loop_array_packed" "p3:outer_loop_tiling_factor" "p4:middle_loop_tiling_factor" "p5:inner_loop_tiling_factor" "objective:runtime"
+

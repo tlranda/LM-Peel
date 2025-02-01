@@ -10,6 +10,8 @@
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 import numpy as np
+import matplotlib
+import matplotlib.pyplot as plt
 
 # Default libraries
 import argparse
@@ -59,8 +61,10 @@ class HF_Interface():
     def __init__(self,
                  model_name: str,
                  seed: int = 1024,
+                 plot: bool = False
                  ):
         self.model_name = model_name
+        self.plot = plot
         self.model = AutoModelForCausalLM.from_pretrained(model_name)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.set_seed(seed)
@@ -117,18 +121,72 @@ class HF_Interface():
         # Vocab is usually string:id, invert it for id:string
         vk = dict((v,k) for (k,v) in self.tokenizer.get_vocab().items())
         # The token IDs we're operating on
-        token_positions = [np.where(~token_logits[0].isinf())[0] for token_logits in output_ids.to_tuple()[1]]
-        logit_values = [[token_logits[0][idx].item() for idx in positions] \
-                        for (token_logits,positions) in zip(output_ids.to_tuple()[1],token_positions)]
+        scores = output_ids.scores
+        # This old version works when only one beam, fails for multi-beam
+        #token_positions = [np.where(~token_logits[0].isinf())[0] for token_logits in output_ids.to_tuple()[1]]
+        #logit_values = [[token_logits[0][idx].item() for idx in positions] \
+        #                for (token_logits,positions) in zip(output_ids.to_tuple()[1],token_positions)]
+        #logit_sort_order = [np.argsort(lv) for lv in logit_values]
         # Lookup has the vocab word for each non-infinite value in the logits
-        # TODO: Reorder token positions based on logit value (greatest-to-least)
-        lookup = [[vk[k] for k in pos] for pos in token_positions]
+        #lookup = [[vk[k] for k in pos[lv]] for pos,lv in zip(token_positions,logit_sort_order)]
         # Argmax == greedy sampling which may not represent the generator's
         # sampling technique -- use `generation_config` to customize that behavior
-        highlight = [np.argmax(tid_list) for tid_list in logit_values]
+        #highlight = [np.argmax(tid_list) for tid_list in logit_values]
+        # Tuple (length #tokens) of tensors (#beams, |vocab|)
+        out_tokens = []
+        out_logits = []
+        reconstruct = []
+        highlight = []
+        logit_sorts = []
+        beam_selection = []
+        for token_number, output_token in enumerate(scores):
+            beam_tokens = []
+            beam_logits = []
+            beam_sorts = []
+            beam_reconstruct = []
+            beam_highlight = []
+            for beam in output_token:
+                generated = np.where(torch.isfinite(beam))[0]
+                # I think this could be different for different beams?
+                #if len(generated) == 0:
+                #    continue
+                beam_tokens.append(generated)
+                beam_logits.append(beam[beam_tokens[-1]])
+                beam_sorts.append(np.argsort(beam_logits[-1]))
+                beam_reconstruct.append([vk[k] for k in beam_tokens[-1]])
+                beam_highlight.append(beam_sorts[-1][0].item())
+            # Nothing more to generate
+            if sum(map(len,beam_tokens)) == 0:
+                break
+            out_tokens.append(beam_tokens)
+            out_logits.append(beam_logits)
+            logit_sorts.append(beam_sorts)
+            reconstruct.append(beam_reconstruct)
+            if len(output_token) == 1:
+                beam_selection.append(0)
+            else:
+                beam_selection.append(output_ids.beam_indices[0,token_number])
+            highlight.append(beam_highlight[beam_selection[-1]])
+
+        #import pdb
+        #pdb.set_trace()
         # Reverse-engineer what highlight SHOULD look like based on the generated text?
-        print("\n".join([str(_) for _ in lookup]))
-        print(highlight)
+        if self.plot:
+            fig, ax = plt.subplots()
+            # Per token generated
+            for x_value, (beam_tokens, beam_heights) in enumerate(zip(reconstruct, out_logits)):
+                n_beams = len(beam_tokens)
+                # Per beam
+                for beam_id, (beam_tok, beam_h) in enumerate(zip(beam_tokens, beam_heights)):
+                    # Per candidate
+                    beam_x = x_value+(beam_id/n_beams)
+                    ax.scatter([beam_x]*len(beam_tok), beam_h)
+                    for (text, height) in zip(beam_tok, beam_h):
+                        ax.text(beam_x, height, text, ha='center',va='center',fontsize=8)
+            plt.show()
+        else:
+            print("\n".join([str(_) for _ in reconstruct]))
+            print(highlight)
 
         return generated_text
 
@@ -152,9 +210,8 @@ def main(model_name: str,
                                                         )
         print(f"Generated Text with seed {seed}:\n{generated_text}")
 
-def build():
+def peeled_huggingface_build_ext(prs):
     default_help = "(default: %(default)s)"
-    prs = argparse.ArgumentParser()
     prs.add_argument("--input", type=str, default=None,
                      help=f"Prompt text for the model")
     prs.add_argument("--input-from-file", action='store_true',
@@ -163,6 +220,25 @@ def build():
                      help=f"System prompt for the model")
     prs.add_argument("--system-prompt-from-file", action='store_true',
                      help=f"Indicates the --system-prompt argument is a file to be read {default_help}")
+    return prs
+
+def peeled_huggingface_parse_ext(args):
+    if args.input is None:
+        args.input = "Once upon a time, in a distant land, there was a mysterious forest."
+    elif args.input_from_file:
+        with open(args.input,'r') as f:
+            args.input = "".join(f.readlines())
+    if args.system_prompt is not None:
+        if args.system_prompt_from_file:
+            with open(args.system_prompt,'r') as f:
+                args.system_prompt = "".join(f.readlines())
+        args.input = [{'role': 'system', 'content': args.system_prompt},
+                      {'role': 'user', 'content': args.input}]
+    return args
+
+def build():
+    default_help = "(default: %(default)s)"
+    prs = argparse.ArgumentParser()
     prs.add_argument("--seeds", type=int, default=None, action='append', nargs="+",
                      required=True, help="RNG seeds for generation")
     prs.add_argument("--model-name", type=str, default="meta-llama/Llama-3.1-8B-Instruct",
@@ -171,7 +247,7 @@ def build():
     gen_config.add_argument("--temperature", type=float, default=0.7,
                             help=f"Softmax sharpening in [0,1] {default_help}")
     gen_config.add_argument("--top-p", type=float, default=0.95,
-                            help=f"Limit sampling to top-% proportion by probability {default_help}")
+                            help=f"Limit sampling to top-%% proportion by probability {default_help}")
     gen_config.add_argument("--top-k", type=int, default=0,
                             help=f"Limit sampling to top-N tokens; typically 0 to disable and use other means {default_help}")
     gen_config.add_argument("--num-beams", type=int, default=1,
@@ -184,11 +260,11 @@ def build():
                             help=f"When doing beam-search, number of decoding sequences to return {default_help}")
     return prs
 
-def parse(args=None, prs=None, prs_extend_fn=None):
+def parse(args=None, prs=None, build_extend_fn=None, prs_extend_fn=None):
     if prs is None:
         prs = build()
-    if prs_extend_fn is not None:
-        prs = prs_extend_fn(prs)
+    if build_extend_fn is not None:
+        prs = build_extend_fn(prs)
     if args is None:
         args = prs.parse_args()
     # Adjust generation config
@@ -205,22 +281,15 @@ def parse(args=None, prs=None, prs_extend_fn=None):
             )
     # Flatten args.seeds
     args.seeds = np.asarray(args.seeds).ravel()
-    if args.input is None:
-        args.input = "Once upon a time, in a distant land, there was a mysterious forest."
-    elif args.input_from_file:
-        with open(args.input,'r') as f:
-            args.input = "".join(f.readlines())
-    if args.system_prompt is not None:
-        if args.system_prompt_from_file:
-            with open(args.system_prompt,'r') as f:
-                args.system_prompt = "".join(f.readlines())
-        args.input = [{'role': 'system', 'content': args.system_prompt},
-                      {'role': 'user', 'content': args.input}]
+
+    if prs_extend_fn is not None:
+        args = prs_extend_fn(args)
     return args
 
 if __name__ == "__main__":
     # CLI
-    args = parse()
+    args = parse(build_extend_fn=peeled_huggingface_build_ext,
+                 prs_extend_fn=peeled_huggingface_parse_ext)
     print(args.gen_config)
 
     # Run the script
