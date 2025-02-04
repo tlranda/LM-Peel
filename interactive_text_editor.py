@@ -19,6 +19,10 @@ class text_trimmer():
         self.current_chunk = key
         return self.chunks[key]
 
+    def getchunk(self, idx):
+        # Get a chunk without updating cursor position/current chunk
+        return self.chunks[idx]
+
     def chunk_text(self, text=None):
         if text is None:
             text = self.text
@@ -30,11 +34,15 @@ class text_trimmer():
         terminators = []
         while len(words) > 0:
             newchunk, idxes, words, lengths, termination = self.build_chunk(words, lengths)
+            if len(terminators) > 0 and terminators[-1] == '\n' and termination == '\n' and len(newchunk) == 0:
+                terminators[-1] += '\n'
+                continue
             chunks.append(newchunk)
             chunk_idxes.append(idxes)
             marks.append([None] * len(idxes))
             terminators.append(termination)
         self.chunks = chunks
+        self.nchunks = len(chunks)
         self.chunk_idxes = chunk_idxes
         self.marks = marks
         self.current_chunk = 0
@@ -75,11 +83,11 @@ class text_trimmer():
         if direction == curses.KEY_LEFT:
             now -= 1
             if now < 0:
-                return
+                return -1
         elif direction == curses.KEY_RIGHT:
             now += 1
             if now >= len(self.chunk_idxes[self.current_chunk]):
-                return
+                return 1
         self.cursor_pos = self.chunk_idxes[self.current_chunk][now]
         if jump is not None and jump > 0:
             self.move_cursor(direction, jump-1)
@@ -146,20 +154,29 @@ def text_input_with_cursor(stdscr, text):
     while True:
         stdscr.clear()
         # Display text
+        for _ in range(chunkidx):
+            # Use .getchunk to not mess with .__getitem__ metadata
+            stdscr.addstr(_, 0, chunker.getchunk(_))
         try:
             if len(chunker[chunkidx]) == 0:
                 chunkidx += 1
                 continue
-            stdscr.addstr(0, 0, chunker[chunkidx])
+            stdscr.addstr(chunkidx, 0, chunker[chunkidx])
         except IndexError:
             break
         # Display cursor line under the current text
-        stdscr.addstr(1, 0, chunker.markstring())
+        stdscr.addstr(chunkidx+1, 0, chunker.markstring())
+        for _ in range(chunkidx+1, chunker.nchunks):
+            stdscr.addstr(_+1, 0, chunker.getchunk(_))
         stdscr.refresh()
         # Get user input
         key = stdscr.getch()
         if key in [curses.KEY_RIGHT, curses.KEY_LEFT]:
-            chunker.move_cursor(key, jump)
+            move = chunker.move_cursor(key, jump)
+            if move is not None:
+                chunkidx += move
+                if chunkidx < 0:
+                    chunkidx = 0
             jump = None
         elif key in [ord(str(num)) for num in range(10)]:
             # Expect 2 to be +2 chunks, so -1 extra
@@ -178,8 +195,6 @@ def text_input_with_cursor(stdscr, text):
 def main():
     # Sample text
     text = \
-    """abc1 abc2 abc3 abc4 abc5 abc6 abc7 abc8 abc9 abc10 abc11 abc12 abc13
-"""
     """This is a sample text. You can navigate through the words with arrow keys.
 It is very very long and you may need more than an entire terminal window to parse all of the text within a singular line. That's a shame because I really want to ramble on and on about things.
 
@@ -187,6 +202,8 @@ It is very very long and you may need more than an entire terminal window to par
 
 
 Another line to gotcha with.
+"""
+    """abc1 abc2 abc3 abc4 abc5 abc6 abc7 abc8 abc9 abc10 abc11 abc12 abc13
 """
     #chunker = text_trimmer(text)
     chunker = curses.wrapper(text_input_with_cursor, text)
