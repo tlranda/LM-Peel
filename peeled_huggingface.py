@@ -168,8 +168,6 @@ class HF_Interface():
                 beam_selection.append(output_ids.beam_indices[0,token_number])
             highlight.append(beam_highlight[beam_selection[-1]])
 
-        #import pdb
-        #pdb.set_trace()
         # Reverse-engineer what highlight SHOULD look like based on the generated text?
         if self.plot:
             fig, ax = plt.subplots()
@@ -188,7 +186,7 @@ class HF_Interface():
             print("\n".join([str(_) for _ in reconstruct]))
             print(highlight)
 
-        return generated_text
+        return generated_text, reconstruct
 
 # Main function to tie everything together
 def main(model_name: str,
@@ -211,15 +209,15 @@ def main(model_name: str,
         print(f"Generated Text with seed {seed}:\n{generated_text}")
 
 def peeled_huggingface_build_ext(prs):
-    default_help = "(default: %(default)s)"
+    dhelp = "(default: %(default)s)"
     prs.add_argument("--input", type=str, default=None,
                      help=f"Prompt text for the model")
     prs.add_argument("--input-from-file", action='store_true',
-                     help=f"Indicates the --input argument is a file to be read {default_help}")
+                     help=f"Indicates the --input argument is a file to be read {dhelp}")
     prs.add_argument("--system-prompt", type=str, default=None,
                      help=f"System prompt for the model")
     prs.add_argument("--system-prompt-from-file", action='store_true',
-                     help=f"Indicates the --system-prompt argument is a file to be read {default_help}")
+                     help=f"Indicates the --system-prompt argument is a file to be read {dhelp}")
     return prs
 
 def peeled_huggingface_parse_ext(args):
@@ -237,27 +235,28 @@ def peeled_huggingface_parse_ext(args):
     return args
 
 def build():
-    default_help = "(default: %(default)s)"
+    dhelp = "(default: %(default)s)"
+    req = "[REQUIRED]"
     prs = argparse.ArgumentParser()
-    prs.add_argument("--seeds", type=int, default=None, action='append', nargs="+",
-                     required=True, help="RNG seeds for generation")
+    prs.add_argument("--seeds", type=int, default=None, action='append', nargs="+", required=True,
+                     help=f"{req} RNG seeds for generation")
     prs.add_argument("--model-name", type=str, default="meta-llama/Llama-3.1-8B-Instruct",
-                     help=f"HuggingFace model to load {default_help}")
+                     help=f"HuggingFace model to load {dhelp}")
     gen_config = prs.add_argument_group("Generation Configuration")
     gen_config.add_argument("--temperature", type=float, default=0.7,
-                            help=f"Softmax sharpening in [0,1] {default_help}")
+                            help=f"Softmax sharpening in [0,1] {dhelp}")
     gen_config.add_argument("--top-p", type=float, default=0.95,
-                            help=f"Limit sampling to top-%% proportion by probability {default_help}")
+                            help=f"Limit sampling to top-%% proportion by probability {dhelp}")
     gen_config.add_argument("--top-k", type=int, default=0,
-                            help=f"Limit sampling to top-N tokens; typically 0 to disable and use other means {default_help}")
+                            help=f"Limit sampling to top-N tokens; typically 0 to disable and use other means {dhelp}")
     gen_config.add_argument("--num-beams", type=int, default=1,
-                            help=f"Number of beams in beam search (1=no beam search) {default_help}")
+                            help=f"Number of beams in beam search (1=no beam search) {dhelp}")
     gen_config.add_argument("--greedy-sample", action='store_true',
-                            help=f"Reduce sampling variation by greedy token search {default_help}")
+                            help=f"Reduce sampling variation by greedy token search {dhelp}")
     gen_config.add_argument("--max-new-tokens", type=int, default=50,
-                            help=f"Number of new tokens permitted in response {default_help}")
+                            help=f"Number of new tokens permitted in response {dhelp}")
     gen_config.add_argument("--num-return-sequences", type=int, default=1,
-                            help=f"When doing beam-search, number of decoding sequences to return {default_help}")
+                            help=f"When doing beam-search, number of decoding sequences to return {dhelp}")
     return prs
 
 def parse(args=None, prs=None, build_extend_fn=None, prs_extend_fn=None):
