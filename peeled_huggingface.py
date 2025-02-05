@@ -253,7 +253,7 @@ def build():
                             help=f"Number of beams in beam search (1=no beam search) {dhelp}")
     gen_config.add_argument("--greedy-sample", action='store_true',
                             help=f"Reduce sampling variation by greedy token search {dhelp}")
-    gen_config.add_argument("--max-new-tokens", type=int, default=50,
+    gen_config.add_argument("--max-new-tokens", type=int, default=500,
                             help=f"Number of new tokens permitted in response {dhelp}")
     gen_config.add_argument("--num-return-sequences", type=int, default=1,
                             help=f"When doing beam-search, number of decoding sequences to return {dhelp}")
