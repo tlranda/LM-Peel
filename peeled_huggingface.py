@@ -186,7 +186,7 @@ class HF_Interface():
             print("\n".join([str(_) for _ in reconstruct]))
             print(highlight)
 
-        return generated_text, reconstruct
+        return generated_text, reconstruct, out_logits
 
 # Main function to tie everything together
 def main(model_name: str,

@@ -7,6 +7,7 @@ from peeled_huggingface import HF_Interface, build, parse
 from interactive_text_editor import chunker_with_cursor, text_trimmer
 
 # Python3 Builtin
+import itertools
 import pathlib
 
 def datasets_load():
@@ -285,20 +286,31 @@ def user_trim_response(text, possibilities, args):
     new_possibilities = possibilities_by_chunks(old_text_chunked_by_possibilities, new_text, possibilities)
     return new_text.rstrip(), new_possibilities
 
-def get_number_fields(possibilities):
+def get_number_fields(possibilities, logits):
     """
         Use possibilities to generate all possible numeric outputs and return them
         as Depth-first-search
     """
-    fielded = []
-    n_beams = len(possibilities[0])
-    # Each beam should be fielded separately
-    import pdb
-    pdb.set_trace()
-    for beam in range(n_beams):
-        n_opts = list(map(lambda x: len(x[beam]), possibilities))
-        progress = [0] * len(n_opts)
-    return fielded
+    all_numbers = []
+    weights = []
+    per_beam = list(itertools.product(*possibilities))
+    for beam_id, beam in enumerate(per_beam):
+        within_beam = list(itertools.product(*beam))
+        string_nums = ["".join(particle) for particle in within_beam]
+        # Somehow map the particles within a beam to their logit values
+        particle_sequence = [1.0] * len(string_nums)
+        beam_numbers = []
+        beam_weight = []
+        for string, weight in zip(string_nums, particle_sequence):
+            try:
+                num = float(string)
+            except:
+                continue
+            beam_numbers.append(num)
+            beam_weight.append(weight)
+        all_numbers.append(beam_numbers)
+        weights.append(beam_weight)
+    return all_numbers, weights
 
 def get_config_search(text, dataset):
     """
@@ -318,10 +330,10 @@ def main():
     model = HF_Interface(args.model_name, plot=args.plot)
     for seed in args.seeds:
         model.set_seed(seed)
-        text, response_possibilities = model.generate_text_and_logits(prompts,
-                                                                      args.gen_config,
-                                                                      None, # Logits processor
-                                                                      )
+        text, response_possibilities, logits = model.generate_text_and_logits(prompts,
+                                                                              args.gen_config,
+                                                                              None, # Logits processor
+                                                                              )
         print(f"Seed {seed} --> {text}")
         # TODO: Evaluate success
         print(f"Ground Truth: {optimal_results}")
@@ -330,8 +342,10 @@ def main():
             print(f"Sorry for bad LLM output :(")
             continue
         if args.response_type == 'quantitative' and args.response_format == 'performance':
-            number_fields = get_number_fields(response_possibilities)
-            print(number_fields)
+            import pdb
+            pdb.set_trace()
+            generable_numbers, weight = get_number_fields(response_possibilities, logits)
+            print(generable_numbers)
         elif args.response_format == 'configuration':
             configs = get_config_search(text, dataset)
             print(configs)
