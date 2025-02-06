@@ -1,23 +1,28 @@
 # Pypi/environment manager of your choice for external package dependency
 import pandas as pd
+import matplotlib
+import matplotlib.pyplot as plt
 import numpy as np
 
 # Local package dependency
 from peeled_huggingface import HF_Interface, build, parse
 from interactive_text_editor import chunker_with_cursor, text_trimmer
+from pickle_cache import PickleCache
 
 # Python3 Builtin
 import itertools
 import pathlib
 
-def datasets_load():
+def datasets_load(args):
     """
         For now this is hard-coded, it should probably get controlled by argparse args at some point
     """
     train = pd.read_csv('training_data.csv')
     sm = pd.read_csv('all_SM_for_LLM.csv')
     xl = pd.read_csv('all_XL_for_LLM.csv')
-    df = pd.concat([train,sm,xl]).reset_index(drop=True)
+    # Sample so the LLM doesn't see sequential rows of data 100% of the time
+    # Use very first seed to guarantee replicability of the results
+    df = pd.concat([train,sm,xl]).sample(frac=1, random_state=args.seeds[0]).reset_index(drop=True)
     return df
 
 def llm_template(df, objective_columns=None, with_answer=False, with_query_answer=False):
@@ -89,8 +94,14 @@ def extend_build(prs):
     out = prs.add_argument_group('Output Settings')
     out.add_argument('--in-text-editing', action='store_true',
                      help=f"Use in-Python editor instead of selecting an editor (or using editor indicated by environment's EDITOR) {dhelp}")
-    out.add_argument('--plot', action='store_true',
-                     help=f"Instead of text output, generate plot of possible outputs")
+    out.add_argument('--title', default=None,
+                     help=f"Title to use in generated plots {dhelp}")
+    out.add_argument('--export', default=None, type=pathlib.Path,
+                     help=f"Filename to save output files to (default: Interactive display)")
+    out.add_argument('--cache', default=None, type=pathlib.Path,
+                     help=f"Cache file to store/recall LLM response/pruning (default: No cache)")
+    out.add_argument('--llm-range-only', action='store_true',
+                     help=f"Limit axes to LLM-generated values only {dhelp}")
     return prs
 
 def extend_prs(args):
@@ -106,9 +117,12 @@ def make_prompts(df, args):
     """
         Create system and user prompts for data based on argument values
         In particular, customizes for quantitative/qualitative, response format,
-        special instructions like 'no repeat' and 'explain', all without mixing test/train data for ICL.
+        special instructions like 'no repeat' and 'explain', all without mixing
+        test/train data for ICL.
 
-        Return the prompts AND whatever data is most relevant based on the prompt to evaluate the success of the LLM at its task
+        Return the prompts, prompt-objectives, AND whatever data is most
+        relevant based on the prompt to evaluate the success of the LLM at its
+        task
     """
     sys_prompt = \
 """The user may describe their optimization problem to give specific context.
@@ -178,6 +192,7 @@ f"""Please provide {quantity_word} candidate responses for each requested comple
     usr_prompt += llm_template(df.loc[icl_eligible[:args.n_ICL]],
                               objective_columns=args.objective_columns,
                               with_answer=True)
+    prompt_objective = df.loc[icl_eligible[:args.n_ICL],args.objective_columns]
     # Drop any ICL eligible items that are INCLUDED in ICL prior to picking evaluations
     dropped_evals = set(eval_eligible).intersection(set(icl_eligible[:args.n_ICL]))
     if len(dropped_evals) > 0:
@@ -201,7 +216,16 @@ f"""Please provide {quantity_word} candidate responses for each requested comple
     else:
         # Best results are based on MAE/MSE vs ground truth
         optimal_results = df.loc[eval_eligible[:args.n_eval]]
-    return prompts, optimal_results
+    return prompts, prompt_objective, optimal_results
+
+def make_hashable_prompts(prompts):
+    """
+        Dictionary cannot be directly hashed, make it hashable for use in caches
+    """
+    out = []
+    for prompt in prompts:
+        out.append(tuple([(k,v) for (k,v) in prompt.items()]))
+    return tuple(out)
 
 def chunk_by_possibilities(text, possibilities):
     """
@@ -235,19 +259,21 @@ def chunk_by_possibilities(text, possibilities):
         # May warn about no matches, but this is likely an EOS token or similar
     return text_chunked
 
-def possibilities_by_chunks(oldtext_map, new_text, possibilities):
+def possibilities_by_chunks(oldtext_map, new_text, possibilities, logits):
     """
         Return list-of-lists(any-length) that can be concatenated by chunk_by_possibilities() to make new_text, based on oldtext_map's mappings (subset of input possibilities)
     """
     newtext_index = 0
     new_poss = []
-    for (oldtext, oldposs) in zip(oldtext_map, possibilities):
+    new_logits = []
+    for (oldtext, oldposs, oldlog) in zip(oldtext_map, possibilities, logits):
         if new_text[newtext_index:].startswith(oldtext):
             new_poss.append(oldposs)
+            new_logits.append(oldlog)
             newtext_index += len(oldtext)
-    return new_poss
+    return new_poss, new_logits
 
-def user_trim_response(text, possibilities, args):
+def user_trim_response(text, possibilities, logits, args):
     """
         Use interactive editor to cull out portions of the final text that aren't relevant to evaluation here, but also associate that culling to the possibilities which is not covered by interactive editor directly
     """
@@ -283,8 +309,13 @@ def user_trim_response(text, possibilities, args):
         subprocess.call([editor_bin, tmp])
         with open(tmp,'r') as f:
             new_text = "".join(f.readlines())
-    new_possibilities = possibilities_by_chunks(old_text_chunked_by_possibilities, new_text, possibilities)
-    return new_text.rstrip(), new_possibilities
+        # Cache will save response
+        tmp.unlink()
+    new_possibilities, new_logits = possibilities_by_chunks(old_text_chunked_by_possibilities,
+                                                            new_text,
+                                                            possibilities,
+                                                            logits)
+    return new_text.rstrip(), new_possibilities, new_logits
 
 def get_number_fields(possibilities, logits):
     """
@@ -294,11 +325,13 @@ def get_number_fields(possibilities, logits):
     all_numbers = []
     weights = []
     per_beam = list(itertools.product(*possibilities))
-    for beam_id, beam in enumerate(per_beam):
+    per_log = list(itertools.product(*logits))
+    for beam_id, (beam, logs) in enumerate(zip(per_beam, per_log)):
         within_beam = list(itertools.product(*beam))
+        within_log  = list(itertools.product(*logs))
         string_nums = ["".join(particle) for particle in within_beam]
         # Somehow map the particles within a beam to their logit values
-        particle_sequence = [1.0] * len(string_nums)
+        particle_sequence = [sum(particle).item() for particle in within_log]
         beam_numbers = []
         beam_weight = []
         for string, weight in zip(string_nums, particle_sequence):
@@ -322,33 +355,127 @@ def get_config_search(text, dataset):
 def main():
     args = parse(build_extend_fn=extend_build,
                  prs_extend_fn=extend_prs)
-    # Make a prompt list
-    dataset = datasets_load()
-    prompts, optimal_results = make_prompts(dataset, args)
+    # Make a prompt list using FIXED seed to load/shuffle data
+    dataset = datasets_load(args)
+    prompts, icl_values, optimal_results = make_prompts(dataset, args)
     print(f"System Prompt: {prompts[0]['content']}")
     print(f"User Prompt: {prompts[1]['content']}")
-    model = HF_Interface(args.model_name, plot=args.plot)
+    print(f"Ground Truth:")
+    print(optimal_results)
+    if args.cache is None:
+        cache = None
+    else:
+        cache = PickleCache(args.cache)
+    to_model = [prompts,
+                args.gen_config,
+                None, # Logits processor
+               ]
+    model = None
+    fig, ax = None, None
+    llm_min, llm_max = None, None
     for seed in args.seeds:
-        model.set_seed(seed)
-        text, response_possibilities, logits = model.generate_text_and_logits(prompts,
-                                                                              args.gen_config,
-                                                                              None, # Logits processor
-                                                                              )
-        print(f"Seed {seed} --> {text}")
-        # TODO: Evaluate success
-        print(f"Ground Truth: {optimal_results}")
-        text, response_possibilities = user_trim_response(text, response_possibilities, args)
+        cached = False
+        hashable_prompts = make_hashable_prompts(to_model[0])
+        cache_key = tuple([args.model_name, seed, hashable_prompts]+to_model[1:])
+        if cache is not None:
+            if cache_key in cache:
+                (text, response_possibilities, logits,
+                 og_text, og_response_possibilities, og_logits) = cache[cache_key]
+                cached = True
+        if not cached:
+            if model is None:
+                model = HF_Interface(args.model_name)
+            model.set_seed(seed)
+            og_text, og_response_possibilities, og_logits = model.generate_text_and_logits(*to_model)
+            text, response_possibilities, logits = user_trim_response(og_text,
+                                                                      og_response_possibilities,
+                                                                      og_logits,
+                                                                      args)
+            if cache is not None:
+                cache[cache_key] = (text, response_possibilities, logits,
+                                    og_text, og_response_possibilities, og_logits)
+                cache.to_pickle()
         if text is None:
             print(f"Sorry for bad LLM output :(")
             continue
+        print(f"Seed {seed} --> {text}")
         if args.response_type == 'quantitative' and args.response_format == 'performance':
-            import pdb
-            pdb.set_trace()
             generable_numbers, weight = get_number_fields(response_possibilities, logits)
-            print(generable_numbers)
+            normalized_weight = np.asarray(weight).ravel()
+            normalized_weight -= min(normalized_weight)
+            normalized_weight /= max(normalized_weight)
+            generable_numbers = np.asarray(generable_numbers).ravel()
+            cand_min = min(generable_numbers)
+            cand_max = max(generable_numbers)
+            if llm_min is None:
+                llm_min = cand_min
+                llm_max = cand_max
+            else:
+                if llm_min > cand_min:
+                    llm_min = cand_min
+                if llm_max < cand_max:
+                    llm_max = cand_max
+            sort = np.argsort(generable_numbers)
+            max_height = max(normalized_weight)
+            if fig is None:
+                fig, ax = plt.subplots(figsize=(12,6))
+                ax.set_xlabel("Number generated")
+                ax.set_ylabel("Normalized likelihood of text generation")
+                # Plot ICL as vlines
+                ax.vlines(icl_values.to_numpy().ravel(), ymin=0.0, ymax=1.0,
+                          alpha=0.5, color='k', zorder=-1,
+                          label="ICL Values")
+                # Plot Ground Truth
+                ax.vlines(optimal_results.loc[optimal_results.index[0], args.objective_columns],
+                          ymin=0.0, ymax=1.0, color='y',
+                          zorder=0, label=f"Ground truth seed {seed}")
+            resps = ax.scatter(generable_numbers[sort], normalized_weight[sort],
+                               alpha=0.6, s=4,
+                               label=f'{args.model_name} Seed {seed}')
+            try:
+                sampled_idx = np.argwhere(generable_numbers == float(text))[0,0]
+                sampled_idx = sort.tolist().index(sampled_idx)
+            except:
+                print(f"Failed to find exact sampling match, using argmax")
+                sampled_idx = np.argmax(normalized_weight)
+            #ax.vlines(float(text), ymin=0.0, ymax=1.0, alpha=0.75, label=f"Sampled response {seed}",
+            #          color=resps.get_facecolor())
+            ax.scatter(float(text), normalized_weight[sort[sampled_idx]],
+                       label=f'Sampled response {seed}', marker='+', s=400,
+                       color=resps.get_facecolor())
+            """
+            opt_x = optimal_results.loc[optimal_results.index[0], args.objective_columns]
+            opt_y = [1.0] * len(opt_x)
+            for idx, x in enumerate(opt_x):
+                if x > min(generable_numbers) and x < max(generable_numbers):
+                    # Find closest generable number and try to use its height
+                    close = np.argmin(abs(x-generable_numbers))
+                    close = sort.tolist().index(close)
+                    opt_y[idx] = normalized_weight[sort[close]]
+            ax.scatter(opt_x, opt_y, color=resps.get_facecolor(),
+                       label=f'Ground Truth Seed {seed}', marker='X')
+            """
         elif args.response_format == 'configuration':
             configs = get_config_search(text, dataset)
             print(configs)
+    if args.title is not None:
+        ax.set_title(args.title)
+    if args.llm_range_only:
+        ax.set_xlim((0.95*llm_min, 1.05*llm_max))
+    ax.legend(loc='best')
+    fig.set_tight_layout(True)
+    if args.export is None:
+        plt.show()
+    else:
+        if args.export.exists():
+            idx = 0
+            while args.export.with_stem(args.export.stem+f"_{idx}").exists():
+                idx += 1
+            new_export = args.export.with_stem(args.export.stem+f"_{idx}")
+            print(f"{args.export} already exists! Moving output to {new_export} instead!")
+            args.export = new_export
+        fig.savefig(args.export, dpi=300)
+        print(f"Figure saved to {args.export}")
 
 if __name__ == '__main__':
     main()

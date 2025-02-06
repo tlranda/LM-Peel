@@ -61,10 +61,12 @@ class HF_Interface():
     def __init__(self,
                  model_name: str,
                  seed: int = 1024,
-                 plot: bool = False
+                 plot: bool = False,
+                 text: bool = False,
                  ):
         self.model_name = model_name
         self.plot = plot
+        self.text = text
         self.model = AutoModelForCausalLM.from_pretrained(model_name)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.set_seed(seed)
@@ -182,7 +184,7 @@ class HF_Interface():
                     for (text, height) in zip(beam_tok, beam_h):
                         ax.text(beam_x, height, text, ha='center',va='center',fontsize=8)
             plt.show()
-        else:
+        if self.text:
             print("\n".join([str(_) for _ in reconstruct]))
             print(highlight)
 
