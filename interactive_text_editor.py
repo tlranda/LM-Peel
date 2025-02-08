@@ -1,4 +1,45 @@
 import curses
+import os
+import pathlib
+import subprocess
+
+text_editor_bin = None
+# Set default editor if environment variable is set
+if 'EDITOR' in os.environ:
+    text_editor_bin = os.environ['EDITOR']
+
+def pick_text_editor():
+    maybe_editors = ['vi','vim','neovim','emacs','nano','gedit']
+    found = {}
+    for editor in maybe_editors:
+        resp = subprocess.run(['which',editor], capture_output=True)
+        if len(resp.stdout) > 0:
+            found[editor] = resp.stdout.decode().rstrip()
+    ite = text_trimmer('\n'.join(found.keys()))
+    ite.cursor_marktext(instructions="Mark ONE editor you'd like to use (or use the EDITOR environment variable in the future to skip)")
+    key = ite.mask(invert=True).rstrip()
+    text_editor_bin = found[key]
+
+def edit_via_editor(text, editor=None, tmp=None, unlink=True):
+    if tmp is None:
+        tmp = pathlib.Path('tmp_editing.txt')
+    tmp = pathlib.Path(tmp)
+    version_number = 0
+    while tmp.exists():
+        tmp = tmp.with_stem(f"{tmp.stem}_{version_number}")
+        version_number += 1
+    with open(tmp,'w') as f:
+        f.write("".join(text))
+    if editor is None:
+        if text_editor_bin is None:
+            pick_text_editor()
+        editor = text_editor_bin
+    subprocess.call([editor_bin, tmp])
+    with open(tmp,'r') as f:
+        new_text = "".join(f.readlines())
+    if unlink:
+        tmp.unlink()
+    return new_text
 
 def chunker_with_cursor(stdscr, chunker, instructions=None):
     # Disable cursor blinking

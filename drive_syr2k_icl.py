@@ -6,7 +6,7 @@ import numpy as np
 
 # Local package dependency
 from peeled_huggingface import HF_Interface, build, parse
-from interactive_text_editor import chunker_with_cursor, text_trimmer
+from interactive_text_editor import chunker_with_cursor, text_trimmer, edit_via_editor
 from pickle_cache import PickleCache
 
 # Python3 Builtin
@@ -94,10 +94,14 @@ def extend_build(prs):
     out = prs.add_argument_group('Output Settings')
     out.add_argument('--in-text-editing', action='store_true',
                      help=f"Use in-Python editor instead of selecting an editor (or using editor indicated by environment's EDITOR) {dhelp}")
+    out.add_argument('--highest-variation-only', action='store_true',
+                     help=f"Only explore variations in highest variable tokens {dhelp}")
     out.add_argument('--title', default=None,
                      help=f"Title to use in generated plots {dhelp}")
     out.add_argument('--export', default=None, type=pathlib.Path,
                      help=f"Filename to save output files to (default: Interactive display)")
+    out.add_argument('--override', action='store_true',
+                     help=f"Override existing files on export {dhelp}")
     out.add_argument('--cache', default=None, type=pathlib.Path,
                      help=f"Cache file to store/recall LLM response/pruning (default: No cache)")
     out.add_argument('--llm-range-only', action='store_true',
@@ -283,49 +287,48 @@ def user_trim_response(text, possibilities, logits, args):
         ite.cursor_marktext()
         new_text = ite.mask()
     else:
-        tmp = pathlib.Path('tmp_llm_response.txt')
-        version_number = 0
-        while tmp.exists():
-            tmp = tmp.with_stem(f'tmp_llm_response_{version_number}')
-            version_number += 1
-        with open(tmp,'w') as f:
-            f.write("".join(text))
-        import os
-        import subprocess
-        if 'EDITOR' in os.environ:
-            editor_bin = os.environ['EDITOR']
-        else:
-            # Try to find a suitable editor
-            maybe_editors = ['vi','vim','neovim','emacs','nano','gedit']
-            found = {}
-            for editor in maybe_editors:
-                resp = subprocess.run(['which',editor], capture_output=True)
-                if len(resp.stdout) > 0:
-                    found[editor] = resp.stdout.decode().rstrip()
-            ite = text_trimmer("\n".join(found.keys()))
-            ite.cursor_marktext(instructions="Mark ONE editor you'd like to use (or use the EDITOR environment variable in the future to skip)")
-            key = ite.mask(invert=True).rstrip()
-            editor_bin = found[key]
-        subprocess.call([editor_bin, tmp])
-        with open(tmp,'r') as f:
-            new_text = "".join(f.readlines())
-        # Cache will save response
-        tmp.unlink()
+        new_text = edit_via_editor(text, tmp='tmp_llm_response.txt')
     new_possibilities, new_logits = possibilities_by_chunks(old_text_chunked_by_possibilities,
                                                             new_text,
                                                             possibilities,
                                                             logits)
     return new_text.rstrip(), new_possibilities, new_logits
 
-def get_number_fields(possibilities, logits):
+def get_number_fields(possibilities, logits, highest_variation_only):
     """
         Use possibilities to generate all possible numeric outputs and return them
         as Depth-first-search
     """
     all_numbers = []
     weights = []
-    per_beam = list(itertools.product(*possibilities))
-    per_log = list(itertools.product(*logits))
+    if highest_variation_only:
+        # Find the one with the most variation and only run that
+        n_possibilities = list(map(lambda x: max(map(len,x)),possibilities))
+        still_variable = np.argmax(n_possibilities)
+        other_possibilities = []
+        other_logs = []
+        # Sometimes the highest logit value for non-variable places would break numbers -- don't do that
+        def intable(v):
+            try:
+                int(v)
+            except:
+                return False
+            return True
+        for (idx, (p,l)) in enumerate(zip(possibilities, logits)):
+            if idx == still_variable:
+                other_possibilities.append(p)
+                other_logs.append(l)
+                continue
+            for (idx2, (pp, ll)) in enumerate(zip(p,l)):
+                considerable = [idx3 for (idx3,v) in enumerate(pp) if v == '.' or intable(v)]
+                best = np.asarray(considerable)[np.argmax(np.asarray(ll)[considerable])]
+                other_possibilities.append([[pp[best]]])
+                other_logs.append([ll[[best]]])
+        per_beam = list(itertools.product(*other_possibilities))
+        per_log = list(itertools.product(*other_logs))
+    else:
+        per_beam = list(itertools.product(*possibilities))
+        per_log = list(itertools.product(*logits))
     for beam_id, (beam, logs) in enumerate(zip(per_beam, per_log)):
         within_beam = list(itertools.product(*beam))
         within_log  = list(itertools.product(*logs))
@@ -373,6 +376,8 @@ def main():
     model = None
     fig, ax = None, None
     llm_min, llm_max = None, None
+    if args.response_type == 'quantitative':
+        llm_min, llm_max = [_.item() for _ in optimal_results.loc[optimal_results.index[0], args.objective_columns]]*2
     for seed in args.seeds:
         cached = False
         hashable_prompts = make_hashable_prompts(to_model[0])
@@ -400,7 +405,7 @@ def main():
             continue
         print(f"Seed {seed} --> {text}")
         if args.response_type == 'quantitative' and args.response_format == 'performance':
-            generable_numbers, weight = get_number_fields(response_possibilities, logits)
+            generable_numbers, weight = get_number_fields(response_possibilities, logits, args.highest_variation_only)
             normalized_weight = np.asarray(weight).ravel()
             normalized_weight -= min(normalized_weight)
             normalized_weight /= max(normalized_weight)
@@ -429,6 +434,8 @@ def main():
                 ax.vlines(optimal_results.loc[optimal_results.index[0], args.objective_columns],
                           ymin=0.0, ymax=1.0, color='y',
                           zorder=0, label=f"Ground truth seed {seed}")
+                ax.scatter(optimal_results.loc[optimal_results.index[0], args.objective_columns],
+                           0.0, marker='x', s=200, color='y', zorder=0)
             resps = ax.scatter(generable_numbers[sort], normalized_weight[sort],
                                alpha=0.6, s=4,
                                label=f'{args.model_name} Seed {seed}')
@@ -438,23 +445,9 @@ def main():
             except:
                 print(f"Failed to find exact sampling match, using argmax")
                 sampled_idx = np.argmax(normalized_weight)
-            #ax.vlines(float(text), ymin=0.0, ymax=1.0, alpha=0.75, label=f"Sampled response {seed}",
-            #          color=resps.get_facecolor())
             ax.scatter(float(text), normalized_weight[sort[sampled_idx]],
                        label=f'Sampled response {seed}', marker='+', s=400,
                        color=resps.get_facecolor())
-            """
-            opt_x = optimal_results.loc[optimal_results.index[0], args.objective_columns]
-            opt_y = [1.0] * len(opt_x)
-            for idx, x in enumerate(opt_x):
-                if x > min(generable_numbers) and x < max(generable_numbers):
-                    # Find closest generable number and try to use its height
-                    close = np.argmin(abs(x-generable_numbers))
-                    close = sort.tolist().index(close)
-                    opt_y[idx] = normalized_weight[sort[close]]
-            ax.scatter(opt_x, opt_y, color=resps.get_facecolor(),
-                       label=f'Ground Truth Seed {seed}', marker='X')
-            """
         elif args.response_format == 'configuration':
             configs = get_config_search(text, dataset)
             print(configs)
@@ -467,7 +460,7 @@ def main():
     if args.export is None:
         plt.show()
     else:
-        if args.export.exists():
+        if args.export.exists() and not args.override:
             idx = 0
             while args.export.with_stem(args.export.stem+f"_{idx}").exists():
                 idx += 1
