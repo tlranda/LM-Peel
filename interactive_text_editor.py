@@ -9,6 +9,7 @@ if 'EDITOR' in os.environ:
     text_editor_bin = os.environ['EDITOR']
 
 def pick_text_editor():
+    global text_editor_bin
     maybe_editors = ['vi','vim','neovim','emacs','nano','gedit']
     found = {}
     for editor in maybe_editors:
@@ -21,6 +22,7 @@ def pick_text_editor():
     text_editor_bin = found[key]
 
 def edit_via_editor(text, editor=None, tmp=None, unlink=True):
+    global text_editor_bin
     if tmp is None:
         tmp = pathlib.Path('tmp_editing.txt')
     tmp = pathlib.Path(tmp)
@@ -34,7 +36,7 @@ def edit_via_editor(text, editor=None, tmp=None, unlink=True):
         if text_editor_bin is None:
             pick_text_editor()
         editor = text_editor_bin
-    subprocess.call([editor_bin, tmp])
+    subprocess.call([editor, tmp])
     with open(tmp,'r') as f:
         new_text = "".join(f.readlines())
     if unlink:
@@ -155,6 +157,8 @@ def chunker_with_cursor(stdscr, chunker, instructions=None):
             chunker.mark()
         elif key == ord("X"):
             chunker.mark_chunk()
+        elif key == 5: # CTRL+e, retry editing via editor function
+            return edit_via_editor(chunker.text)
         elif key in [ord('Q'), ord('q'), 27]: # 27 == ESC key
             break
 
@@ -426,7 +430,7 @@ class text_trimmer():
 
             Instructions passed as extra prompt beyond editor controls
         """
-        curses.wrapper(chunker_with_cursor, self, instructions)
+        return curses.wrapper(chunker_with_cursor, self, instructions)
 
 # This function can be used as a callback to CREATE the trimmer object with
 # given text and then duplicate chunker_with_cursor -- it was for development
