@@ -380,6 +380,10 @@ def main():
         cache = PickleCache(args.cache)
     model = None
     rounds = make_prompts(dataset, args)
+    errors = []
+    rel_errors = []
+    copied = []
+    possibly_copied = []
     for (roundidx, _round) in enumerate(rounds):
         prompts, icl_values, optimal_results = _round
         print(f"System Prompt: {prompts[0]['content']}")
@@ -421,11 +425,19 @@ def main():
                 continue
             print(f"Seed {seed} --> {text}")
             if args.response_type == 'quantitative' and args.response_format == 'performance':
+                gen_number = float(text)
+                errors.append(optimal_results.loc[optimal_results.index[0], args.objective_columns]-gen_number)
+                rel_errors.append((optimal_results.loc[optimal_results.index[0], args.objective_columns]-gen_number)/optimal_results.loc[optimal_results.index[0], args.objective_columns])
+                copied.append(gen_number in icl_values.to_numpy())
                 generable_numbers, weight = get_number_fields(response_possibilities, logits, args.highest_variation_only)
                 normalized_weight = np.asarray(weight).ravel()
                 normalized_weight -= min(normalized_weight)
                 normalized_weight /= max(normalized_weight)
                 generable_numbers = np.asarray(generable_numbers).ravel()
+                possibly_copied.append(0)
+                for icl_check in icl_values.to_numpy().ravel():
+                    if icl_check == gen_number:
+                        possibly_copied[-1] += 1
                 cand_min = min(generable_numbers)
                 cand_max = max(generable_numbers)
                 if llm_min is None:
@@ -486,6 +498,14 @@ def main():
                 export = new_export
             fig.savefig(export, dpi=300)
             print(f"Figure saved to {export}")
+    print(f"Across {args.n_rounds} rounds, accumulated errors:")
+    print("\t"+f"MAE: {np.mean(np.abs(errors))}")
+    print("\t"+f"MSE: {np.mean(np.asarray(errors)**2)}")
+    print(f"As relative ratio errors:")
+    print("\t"+f"MAE: {np.mean(np.abs(rel_errors))}")
+    print("\t"+f"MSE: {np.mean(np.asarray(rel_errors)**2)}")
+    print(f"# Copied answers: {np.sum(copied)}")
+    print(f"# Possible Copied answers: {np.sum(possibly_copied)}")
 
 if __name__ == '__main__':
     main()
