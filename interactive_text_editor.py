@@ -1,3 +1,4 @@
+import copy
 import curses
 import os
 import pathlib
@@ -26,10 +27,12 @@ def edit_via_editor(text, editor=None, tmp=None, unlink=True):
     if tmp is None:
         tmp = pathlib.Path('tmp_editing.txt')
     tmp = pathlib.Path(tmp)
+    base_tmp = copy.copy(tmp)
     version_number = 0
     while tmp.exists():
-        tmp = tmp.with_stem(f"{tmp.stem}_{version_number}")
+        tmp = tmp.with_stem(f"{base_tmp.stem}_{version_number}")
         version_number += 1
+    del base_tmp
     with open(tmp,'w') as f:
         f.write("".join(text))
     if editor is None:

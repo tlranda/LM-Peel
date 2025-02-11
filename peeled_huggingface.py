@@ -112,6 +112,7 @@ class HF_Interface():
                 logits_processor=logits_processor, # If you want to affect logits *during* generation
                 output_scores=True, # Enable score output to capture logits
                 return_dict_in_generate=True, # Passed to .forward() or something
+                seed=self.seed, # Ensure seeding is correct
                 return_legacy_cache=True, # Ensure HF API update doesn't hurt past v4.47 (deprecation notice)
             )
 

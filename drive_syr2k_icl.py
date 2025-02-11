@@ -8,49 +8,13 @@ import numpy as np
 from peeled_huggingface import HF_Interface, build, parse
 from interactive_text_editor import chunker_with_cursor, text_trimmer, edit_via_editor
 from pickle_cache import PickleCache
+from timerdict import TimerDict
 
 # Python3 Builtin
 import itertools
+import multiprocessing
 import pathlib
-
-def datasets_load(args):
-    """
-        For now this is hard-coded, it should probably get controlled by argparse args at some point
-    """
-    train = pd.read_csv('training_data.csv')
-    sm = pd.read_csv('all_SM_for_LLM.csv')
-    xl = pd.read_csv('all_XL_for_LLM.csv')
-    # Sample so the LLM doesn't see sequential rows of data 100% of the time
-    # Use very first seed to guarantee replicability of the results
-    df = pd.concat([train,sm,xl]).sample(frac=1, random_state=args.seeds[0]).reset_index(drop=True)
-    return df
-
-def llm_template(df, objective_columns=None, with_answer=False, with_query_answer=False):
-    """
-        Create the LLM-ready text representation of all data in df (DataFrame)
-        * objective_columns = performance indicator if with_answer==True
-        * with_answer = SHOW the answer
-        * with_query_answer = SHOW prompt for answer, but withhold actual answer
-    """
-    if objective_columns is None:
-        objective_columns = list()
-    param_columns = [_ for _ in df.columns if _ not in objective_columns]
-    n_params = len(param_columns)
-    resp = []
-    for (rowidx, row) in df.iterrows():
-        config = "Hyperparameter configuration: "
-        for idx, (col, val) in enumerate(row.to_dict().items()):
-            if col in objective_columns:
-                continue
-            config += f"{col} is {val}"
-            if idx < n_params-1:
-                config += ","
-        if with_answer:
-            config += "\n"+f"Performance: ## {', '.join([str(_) for _ in row[objective_columns]])} ##"
-        elif with_query_answer:
-            config += "\nPerformance: "
-        resp.append(config)
-    return resp
+import time
 
 def extend_build(prs):
     """
@@ -66,6 +30,8 @@ def extend_build(prs):
                      help=f"Number of evaluations to request {dhelp}")
     eval_settings.add_argument('--n-rounds', type=int, default=1,
                      help=f"Number of rounds of evaluations to request from the dataset (disjoint ICLs on same seeds) {dhelp}")
+    eval_settings.add_argument('--skip-rounds', type=int, default=None, nargs="*", action='append',
+                     help=f"Round indices (0-base indexed) to skip {dhelp}")
     eval_settings.add_argument('--response-type', choices=['qualitative','quantitative'], required=True,
                      help=f"{req} Type of response the LLM should create {dhelp}")
     eval_settings.add_argument('--response-format', choices=['performance','configuration'], default='performance',
@@ -86,26 +52,36 @@ def extend_build(prs):
     llm_instruct = prs.add_argument_group('LLM Instruction Tweaks')
     llm_instruct.add_argument('--problem-introduction', default=None,
                      help=f"Plaintext or path-to-plaintext-document with instructions about the user prompt {dhelp}")
+    llm_instruct.add_argument('--dataset-shuffle-seed', default=None, type=int,
+                     help=f"Seed used for dataset shuffling (performed once on load, default: first argument to --seed)")
     llm_instruct.add_argument('--qualitative-quantity', choices=['one','many','unstated'], default='one',
                      help=f"When response type is QUALITATIVE, request this many LLM responses {dhelp}")
     llm_instruct.add_argument('--explain', action='store_true',
                      help=f"System Prompt encourages LLM to explain prior to answering {dhelp}")
     llm_instruct.add_argument('--no-repeat', action='store_true',
                      help=f"System Prompt encourages LLM to not repeat prior ICL values for quantitative/performance evaluations {dhelp}")
+    llm_instruct.add_argument('--scientific-notation', action='store_true',
+                     help=f"Express numeric values for performance in scientific notation {dhelp}")
     # Output settings
     out = prs.add_argument_group('Output Settings')
+    out.add_argument("--show-prompts", action='store_true',
+                     help=f"Show the generated prompts before serving them {dhelp}")
+    out.add_argument('--cache', default=None, type=pathlib.Path,
+                     help=f"Cache file to store/recall LLM response/pruning (default: No cache)")
     out.add_argument('--in-text-editing', action='store_true',
                      help=f"Use in-Python editor instead of selecting an editor (or using editor indicated by environment's EDITOR) {dhelp}")
     out.add_argument('--highest-variation-only', action='store_true',
                      help=f"Only explore variations in highest variable tokens {dhelp}")
+    out.add_argument('--haystack-error', default=None, action='append', type=float, nargs="*",
+                     help=f"Error bound (as ratios) for a 'needle' generated value to be 'pickable' in the 'haystack' of generable numbers {dhelp}")
+    out.add_argument('--no-plot', action='store_true',
+                     help=f"Do not produce plots {dhelp}")
     out.add_argument('--title', default=None,
                      help=f"Title to use in generated plots {dhelp}")
     out.add_argument('--export', default=None, type=pathlib.Path,
                      help=f"Filename to save output files to (default: Interactive display)")
     out.add_argument('--override', action='store_true',
                      help=f"Override existing files on export {dhelp}")
-    out.add_argument('--cache', default=None, type=pathlib.Path,
-                     help=f"Cache file to store/recall LLM response/pruning (default: No cache)")
     out.add_argument('--llm-range-only', action='store_true',
                      help=f"Limit axes to LLM-generated values only {dhelp}")
     return prs
@@ -115,9 +91,57 @@ def extend_prs(args):
         Parse bonus args from extend_build() as needed
     """
     flatten = lambda x: np.asarray(x).ravel().tolist()
-    for to_flat in ['objective_columns','ICL_classes','eval_classes']:
+    for to_flat in ['objective_columns','ICL_classes','eval_classes','skip_rounds','haystack_error']:
         setattr(args,to_flat,flatten(getattr(args,to_flat)))
     return args
+
+def datasets_load(args):
+    """
+        For now this is hard-coded, it should probably get controlled by argparse args at some point
+    """
+    train = pd.read_csv('training_data.csv')
+    sm = pd.read_csv('all_SM_for_LLM.csv')
+    xl = pd.read_csv('all_XL_for_LLM.csv')
+    # Sample so the LLM doesn't see sequential rows of data 100% of the time
+    # Use very first seed to guarantee replicability of the results, unless
+    # the user gave a particular seed for shuffling (ie: re-investigating a
+    # later seed without running the former seed(s))
+    shuffle_seed = args.seeds[0]
+    if args.dataset_shuffle_seed is not None:
+        shuffle_seed = args.dataset_shuffle_seed
+    df = pd.concat([train,sm,xl]).sample(frac=1, random_state=shuffle_seed).reset_index(drop=True)
+    return df
+
+def llm_template(df, objective_columns=None, with_answer=False, with_query_answer=False, scientific=False):
+    """
+        Create the LLM-ready text representation of all data in df (DataFrame)
+        * objective_columns = performance indicator if with_answer==True
+        * with_answer = SHOW the answer
+        * with_query_answer = SHOW prompt for answer, but withhold actual answer
+    """
+    if objective_columns is None:
+        objective_columns = list()
+    param_columns = [_ for _ in df.columns if _ not in objective_columns]
+    n_params = len(param_columns)
+    resp = []
+    for (rowidx, row) in df.iterrows():
+        config = "Hyperparameter configuration: "
+        for idx, (col, val) in enumerate(row.to_dict().items()):
+            if col in objective_columns:
+                continue
+            config += f"{col} is {val}"
+            if idx < n_params-1:
+                config += ","
+        if with_answer:
+            if scientific:
+                performance = ', '.join([f"{_:.6E}" for _ in row[objective_columns]])
+            else:
+                performance = ', '.join([f"{_}" for _ in row[objective_columns]])
+            config += "\n"+f"Performance: ## {performance} ##"
+        elif with_query_answer:
+            config += "\nPerformance: "
+        resp.append(config)
+    return resp
 
 def make_prompts(df, args):
     """
@@ -206,7 +230,7 @@ f"""Please provide {quantity_word} candidate responses for each requested comple
         used_icl.extend([_ for _ in icl_eligible[:args.n_ICL]])
         usr_prompt += llm_template(df.loc[icl_eligible[:args.n_ICL]],
                                   objective_columns=args.objective_columns,
-                                  with_answer=True)
+                                  with_answer=True, scientific=args.scientific_notation)
         prompt_objective = df.loc[icl_eligible[:args.n_ICL],args.objective_columns]
         # Drop any ICL eligible items that are INCLUDED in ICL prior to picking evaluations
         dropped_evals = set(eval_eligible).intersection(set(icl_eligible[:args.n_ICL]))
@@ -220,7 +244,7 @@ f"""Please provide {quantity_word} candidate responses for each requested comple
         used_eval.extend([_ for _ in eval_eligible[:args.n_eval]])
         usr_prompt += llm_template(df.loc[eval_eligible[:args.n_eval]],
                                    objective_columns=args.objective_columns,
-                                   with_query_answer=True)
+                                   with_query_answer=True, scientific=args.scientific_notation)
         usr_prompt = "\n".join(usr_prompt)
         prompts = [{'role': 'system', 'content': sys_prompt},
                    {'role': 'user', 'content': usr_prompt},
@@ -308,16 +332,28 @@ def user_trim_response(text, possibilities, logits, args):
                                                             logits)
     return new_text.rstrip(), new_possibilities, new_logits
 
+def generate_beam_numbers(beam_and_log):
+    """
+        Parallelizable version -- especially important when there are millions of combinations
+    """
+    within_beam, within_log = beam_and_log
+    string_num = "".join(within_beam)
+    weight = sum([particle.item() for particle in within_log])
+    try:
+        num = float(string_num)
+    except:
+        return None
+    return num, weight
+
 def get_number_fields(possibilities, logits, highest_variation_only):
     """
         Use possibilities to generate all possible numeric outputs and return them
         as Depth-first-search
     """
-    all_numbers = []
-    weights = []
+    n_possibilities = list(map(lambda x: max(map(len,x)),possibilities))
+    print(f"N_possibilities per token {n_possibilities} (total={np.prod(n_possibilities)})")
     if highest_variation_only:
         # Find the one with the most variation and only run that
-        n_possibilities = list(map(lambda x: max(map(len,x)),possibilities))
         still_variable = np.argmax(n_possibilities)
         other_possibilities = []
         other_logs = []
@@ -334,7 +370,8 @@ def get_number_fields(possibilities, logits, highest_variation_only):
                 other_logs.append(l)
                 continue
             for (idx2, (pp, ll)) in enumerate(zip(p,l)):
-                considerable = [idx3 for (idx3,v) in enumerate(pp) if v == '.' or intable(v)]
+                # Scientific notation permits 'E+' and 'E-' in addition to decimal point
+                considerable = [idx3 for (idx3,v) in enumerate(pp) if v in '.-+E' or intable(v)]
                 best = np.asarray(considerable)[np.argmax(np.asarray(ll)[considerable])]
                 other_possibilities.append([[pp[best]]])
                 other_logs.append([ll[[best]]])
@@ -343,6 +380,23 @@ def get_number_fields(possibilities, logits, highest_variation_only):
     else:
         per_beam = list(itertools.product(*possibilities))
         per_log = list(itertools.product(*logits))
+
+    all_numbers = []
+    weights = []
+
+    for beam_id, (beam, logs) in enumerate(zip(per_beam, per_log)):
+        within_beam = list(itertools.product(*beam))
+        within_log  = list(itertools.product(*logs))
+        with multiprocessing.Pool() as pool:
+            results = pool.map(generate_beam_numbers, zip(within_beam, within_log))
+        for rval in results:
+            if rval is None:
+                continue
+            number, weight = rval
+            all_numbers.append(number)
+            weights.append(weight)
+
+    """
     for beam_id, (beam, logs) in enumerate(zip(per_beam, per_log)):
         within_beam = list(itertools.product(*beam))
         within_log  = list(itertools.product(*logs))
@@ -360,6 +414,7 @@ def get_number_fields(possibilities, logits, highest_variation_only):
             beam_weight.append(weight)
         all_numbers.append(beam_numbers)
         weights.append(beam_weight)
+    """
     return all_numbers, weights
 
 def get_config_search(text, dataset):
@@ -372,22 +427,36 @@ def get_config_search(text, dataset):
 def main():
     args = parse(build_extend_fn=extend_build,
                  prs_extend_fn=extend_prs)
+    td = TimerDict()
+    td['all_runtime']
     # Make a prompt list using FIXED seed to load/shuffle data
+    td['dataset_prep']
     dataset = datasets_load(args)
+    td['dataset_prep']
+    td['cache_load']
     if args.cache is None:
         cache = None
     else:
         cache = PickleCache(args.cache)
+    td['cache_load']
     model = None
+    td['make_prompts']
     rounds = make_prompts(dataset, args)
+    td['make_prompts']
     errors = []
     rel_errors = []
     copied = []
     possibly_copied = []
+    n_haystack = []
     for (roundidx, _round) in enumerate(rounds):
+        td[('round',f'Round: {roundidx}')]
         prompts, icl_values, optimal_results = _round
-        print(f"System Prompt: {prompts[0]['content']}")
-        print(f"User Prompt: {prompts[1]['content']}")
+        if roundidx in args.skip_rounds:
+            td[('round',f'Round: {roundidx}')]
+            continue
+        if args.show_prompts:
+            print(f"System Prompt: {prompts[0]['content']}")
+            print(f"User Prompt: {prompts[1]['content']}")
         print(f"Ground Truth:")
         print(optimal_results)
         to_model = [prompts,
@@ -402,6 +471,7 @@ def main():
             cached = False
             hashable_prompts = make_hashable_prompts(to_model[0])
             cache_key = tuple([args.model_name, seed, hashable_prompts]+to_model[1:])
+            td[('llm',f'Round: {roundidx}',f'Seed: {seed}')]
             if cache is not None:
                 if cache_key in cache:
                     (text, response_possibilities, logits,
@@ -411,29 +481,54 @@ def main():
                 if model is None:
                     model = HF_Interface(args.model_name)
                 model.set_seed(seed)
+                td[('generate_with_logits',f'Round: {roundidx}',f'Seed: {seed}')]
                 og_text, og_response_possibilities, og_logits = model.generate_text_and_logits(*to_model)
+                td[('generate_with_logits',f'Round: {roundidx}',f'Seed: {seed}')]
+                td[('user_trim',f'Round: {roundidx}',f'Seed: {seed}')]
                 text, response_possibilities, logits = user_trim_response(og_text,
                                                                           og_response_possibilities,
                                                                           og_logits,
                                                                           args)
+                td[('user_trim',f'Round: {roundidx}',f'Seed: {seed}')]
                 if cache is not None:
                     cache[cache_key] = (text, response_possibilities, logits,
                                         og_text, og_response_possibilities, og_logits)
                     cache.to_pickle()
+            td[('llm',f'Round: {roundidx}',f'Seed: {seed}')]
             if text is None:
                 print(f"Sorry for bad LLM output :(")
                 continue
             print(f"Seed {seed} --> {text}")
             if args.response_type == 'quantitative' and args.response_format == 'performance':
-                gen_number = float(text)
-                errors.append(optimal_results.loc[optimal_results.index[0], args.objective_columns]-gen_number)
-                rel_errors.append((optimal_results.loc[optimal_results.index[0], args.objective_columns]-gen_number)/optimal_results.loc[optimal_results.index[0], args.objective_columns])
+                td[('quantitative_perf_analysis',f'Round: {roundidx}',f'Seed: {seed}')]
+                try:
+                    gen_number = float(text)
+                    # Have to push bounds check here in case highest variability excludes the sampled value
+                    if llm_min > gen_number:
+                        llm_min = gen_number
+                    if llm_max < gen_number:
+                        llm_max = gen_number
+                except:
+                    print(f"Sorry, LLM did not produce a number :(")
+                    td[('quantitative_perf_analysis',f'Round: {roundidx}',f'Seed: {seed}')]
+                    continue
+                optimal_number = optimal_results.loc[optimal_results.index[0], args.objective_columns].item()
+                errors.append(optimal_number-gen_number)
+                rel_errors.append((optimal_number-gen_number)/optimal_number)
                 copied.append(gen_number in icl_values.to_numpy())
+                td[('number_fields',f'Round: {roundidx}',f'Seed: {seed}')]
                 generable_numbers, weight = get_number_fields(response_possibilities, logits, args.highest_variation_only)
+                td[('number_fields',f'Round: {roundidx}',f'Seed: {seed}')]
                 normalized_weight = np.asarray(weight).ravel()
                 normalized_weight -= min(normalized_weight)
                 normalized_weight /= max(normalized_weight)
                 generable_numbers = np.asarray(generable_numbers).ravel()
+                if args.haystack_error[0] is not None:
+                    for error_bound in args.haystack_error:
+                        n_haystack.append(len(np.where((np.abs(optimal_number-generable_numbers)/optimal_number) <= error_bound)[0]))
+                        print(f"Haystack needles @{error_bound}: {n_haystack[-1]}")
+                print(f"Range of generable values: {min(generable_numbers)}, {max(generable_numbers)}")
+                print(f"Median generated value: {np.median(generable_numbers)}")
                 possibly_copied.append(0)
                 for icl_check in icl_values.to_numpy().ravel():
                     if icl_check == gen_number:
@@ -450,54 +545,62 @@ def main():
                         llm_max = cand_max
                 sort = np.argsort(generable_numbers)
                 max_height = max(normalized_weight)
-                if fig is None:
-                    fig, ax = plt.subplots(figsize=(12,6))
-                    ax.set_xlabel("Number generated")
-                    ax.set_ylabel("Normalized likelihood of text generation")
-                    # Plot ICL as vlines
-                    ax.vlines(icl_values.to_numpy().ravel(), ymin=0.0, ymax=1.0,
-                              alpha=0.5, color='k', zorder=-1,
-                              label="ICL Values")
-                    # Plot Ground Truth
-                    ax.vlines(optimal_results.loc[optimal_results.index[0], args.objective_columns],
-                              ymin=0.0, ymax=1.0, color='y',
-                              zorder=0, label=f"Ground truth seed {seed}")
-                    ax.scatter(optimal_results.loc[optimal_results.index[0], args.objective_columns],
-                               0.0, marker='x', s=200, color='y', zorder=0)
-                resps = ax.scatter(generable_numbers[sort], normalized_weight[sort],
-                                   alpha=0.6, s=4,
-                                   label=f'{args.model_name} Seed {seed}')
-                try:
-                    sampled_idx = np.argwhere(generable_numbers == float(text))[0,0]
-                    sampled_idx = sort.tolist().index(sampled_idx)
-                except:
-                    print(f"Failed to find exact sampling match, using argmax")
-                    sampled_idx = np.argmax(normalized_weight)
-                ax.scatter(float(text), normalized_weight[sort[sampled_idx]],
-                           label=f'Sampled response {seed}', marker='+', s=400,
-                           color=resps.get_facecolor())
+                if not args.no_plot:
+                    td[('plot',f'Round: {roundidx}',f'Seed: {seed}')]
+                    if fig is None:
+                        fig, ax = plt.subplots(figsize=(12,6))
+                        ax.set_xlabel("Number generated")
+                        ax.set_ylabel("Normalized likelihood of text generation")
+                        # Plot ICL as vlines
+                        ax.vlines(icl_values.to_numpy().ravel(), ymin=0.0, ymax=1.0,
+                                  alpha=0.5, color='k', zorder=-1,
+                                  label="ICL Values")
+                        # Plot Ground Truth
+                        ax.vlines(optimal_results.loc[optimal_results.index[0], args.objective_columns],
+                                  ymin=0.0, ymax=1.0, color='y',
+                                  zorder=0, label=f"Ground truth seed {seed}")
+                        ax.scatter(optimal_results.loc[optimal_results.index[0], args.objective_columns],
+                                   0.0, marker='x', s=200, color='y', zorder=0)
+                    resps = ax.scatter(generable_numbers[sort], normalized_weight[sort],
+                                       alpha=0.6, s=4,
+                                       label=f'{args.model_name} Seed {seed}')
+                    try:
+                        sampled_idx = np.argwhere(generable_numbers == float(text))[0,0]
+                        sampled_idx = sort.tolist().index(sampled_idx)
+                        sampled_logit = normalized_weight[sort[sampled_idx]]
+                    except:
+                        print(f"Failed to find exact sampling match, using 1.0 height default for sampled value")
+                        #sampled_idx = np.argmax(normalized_weight)
+                        sampled_logit = 1.0
+                    ax.scatter(float(text), sampled_logit,
+                               label=f'Sampled response {seed}', marker='+', s=400,
+                               color=resps.get_facecolor())
+                    td[('plot',f'Round: {roundidx}',f'Seed: {seed}')]
+                td[('quantitative_perf_analysis',f'Round: {roundidx}',f'Seed: {seed}')]
             elif args.response_format == 'configuration':
                 configs = get_config_search(text, dataset)
                 print(configs)
-        if args.title is not None:
-            ax.set_title(args.title)
-        if args.llm_range_only:
-            ax.set_xlim((0.95*llm_min, 1.05*llm_max))
-        ax.legend(loc='best')
-        fig.set_tight_layout(True)
-        if args.export is None:
-            plt.show()
-        else:
-            export = args.export.with_stem(f"{args.export.stem}_round_{roundidx}")
-            if export.exists() and not args.override:
-                idx = 0
-                while export.with_stem(export.stem+f"_{idx}").exists():
-                    idx += 1
-                new_export = export.with_stem(args.export.stem+f"_{idx}")
-                print(f"{export} already exists! Moving output to {new_export} instead!")
-                export = new_export
-            fig.savefig(export, dpi=300)
-            print(f"Figure saved to {export}")
+        if not args.no_plot:
+            if args.title is not None:
+                ax.set_title(args.title)
+            if args.llm_range_only:
+                ax.set_xlim((0.95*llm_min, 1.05*llm_max))
+            ax.legend(loc='best')
+            fig.set_tight_layout(True)
+            if args.export is None:
+                plt.show()
+            else:
+                export = args.export.with_stem(f"{args.export.stem}_round_{roundidx}")
+                if export.exists() and not args.override:
+                    idx = 0
+                    while export.with_stem(export.stem+f"_{idx}").exists():
+                        idx += 1
+                    new_export = export.with_stem(args.export.stem+f"_{idx}")
+                    print(f"{export} already exists! Moving output to {new_export} instead!")
+                    export = new_export
+                fig.savefig(export, dpi=300)
+                print(f"Figure saved to {export}")
+        td[('round',f'Round: {roundidx}')]
     print(f"Across {args.n_rounds} rounds, accumulated errors:")
     print("\t"+f"MAE: {np.mean(np.abs(errors))}")
     print("\t"+f"MSE: {np.mean(np.asarray(errors)**2)}")
@@ -506,6 +609,12 @@ def main():
     print("\t"+f"MSE: {np.mean(np.asarray(rel_errors)**2)}")
     print(f"# Copied answers: {np.sum(copied)}")
     print(f"# Possible Copied answers: {np.sum(possibly_copied)}")
+    td['all_runtime']
+    print(td.dump())
+    if cache is not None:
+        import datetime
+        cache[f"Timings for execution @ {datetime.datetime.now()}"] = td.dump()
+        cache.to_pickle()
 
 if __name__ == '__main__':
     main()
