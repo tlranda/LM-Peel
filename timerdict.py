@@ -45,6 +45,13 @@ class TimerDict():
         self.timers[key] = propose - self.timers[key]
         self.closed_intervals.add(key)
 
+    def reopen(self, key):
+        # For intentionally overriding a previously closed interval
+        if key not in self.closed_intervals:
+            raise KeyError(f"Key '{key}' is not closed")
+        self.opened_intervals.remove(key)
+        self.closed_intervals.remove(key)
+
     def dump(self):
         closed_timers = dict((k,self.timers[k]) for k in self.closed_intervals)
         return (closed_timers, self.opened_intervals.difference(self.closed_intervals))
