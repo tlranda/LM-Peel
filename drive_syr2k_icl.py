@@ -359,7 +359,11 @@ def get_number_fields(possibilities, logits, highest_variation_only):
         as Depth-first-search
     """
     n_possibilities = list(map(lambda x: max(map(len,x)),possibilities))
-    print(f"N_possibilities per token {n_possibilities} (total={np.prod(n_possibilities)})")
+    total_poss = np.prod(n_possibilities)
+    print(f"N_possibilities per token {n_possibilities} (total={total_poss})")
+    if not highest_variation_only and total_pos > 500_000_000:
+        print(f"That's a bit too much; how about just the highest variation this time")
+        highest_variation_only = True
     if highest_variation_only:
         # Find the one with the most variation and only run that
         still_variable = np.argmax(n_possibilities)
