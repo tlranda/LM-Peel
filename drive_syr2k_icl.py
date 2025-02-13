@@ -331,7 +331,7 @@ def user_trim_response(text, possibilities, logits, args):
         ite = text_trimmer(text[text.index('assistant')+len('assistant')+2:])
         new_text = ite.cursor_marktext(instructions="CTRL+e if you need a proper editor")
         if new_text is None:
-            new_text = ite.mask()
+            new_text = ite.mask(invert=True)
     else:
         new_text = edit_via_editor(text, tmp='tmp_llm_response.txt')
     new_possibilities, new_logits = possibilities_by_chunks(old_text_chunked_by_possibilities,
@@ -361,7 +361,7 @@ def get_number_fields(possibilities, logits, highest_variation_only):
     n_possibilities = list(map(lambda x: max(map(len,x)),possibilities))
     total_poss = np.prod(n_possibilities)
     print(f"N_possibilities per token {n_possibilities} (total={total_poss})")
-    if not highest_variation_only and total_pos > 500_000_000:
+    if not highest_variation_only and total_poss > 250_000_000:
         print(f"That's a bit too much; how about just the highest variation this time")
         highest_variation_only = True
     if highest_variation_only:
@@ -554,7 +554,7 @@ def main():
                 # if not validated and we'll try again. Do nothing to fall
                 # through and validate/exit the infinite loop
                 if text is None:
-                    if args.interactive_text_editor:
+                    if args.in_text_editing:
                         td[td_loop_key]
                         if request_retry("LLM did not produce a response"):
                             continue
@@ -568,7 +568,7 @@ def main():
                     try:
                         gen_number = float(text)
                     except:
-                        if args.interactive_text_editor:
+                        if args.in_text_editing:
                             td[td_loop_key]
                             if request_retry(f"LLM did not produce a number: '{text}'"):
                                 continue
