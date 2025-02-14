@@ -29,6 +29,8 @@ def extend_build(prs):
                      help=f"All CSVs in this directory are combined for the dataset to use {dhelp}")
     dataset_settings.add_argument('--dataset-shuffle-seed', default=None, type=int,
                      help=f"Seed used for dataset shuffling (performed once on load, default: first argument to --seed)")
+    dataset_settings.add_argument('--curate-dataset', action='store_true',
+                     help=f"Attempt to pick configurations for ICL / EVAL that are highly similar {dhelp}")
     dataset_settings.add_argument('--class-column', default='size',
                      help=f"Which column is used to determine class {dhelp}")
     dataset_settings.add_argument('--ICL-classes', default=None, nargs="+", action='append', required=True,
@@ -104,6 +106,8 @@ def extend_prs(args):
     flatten = lambda x: np.asarray(x).ravel().tolist()
     for to_flat in ['objective_columns','ICL_classes','eval_classes','skip_rounds','haystack_error']:
         setattr(args,to_flat,flatten(getattr(args,to_flat)))
+    if args.dataset_shuffle_seed is None:
+        args.dataset_shuffle_seed = args.seeds[0]
     return args
 
 def datasets_load(args):
@@ -111,14 +115,14 @@ def datasets_load(args):
         For now this is hard-coded, it should probably get controlled by argparse args at some point
     """
     df = pd.concat([pd.read_csv(_) for _ in pathlib.Path(args.dataset_dir).iterdir() if _.suffix == '.csv'])
-    # Sample so the LLM doesn't see sequential rows of data 100% of the time
-    # Use very first seed to guarantee replicability of the results, unless
-    # the user gave a particular seed for shuffling (ie: re-investigating a
-    # later seed without running the former seed(s))
-    shuffle_seed = args.seeds[0]
-    if args.dataset_shuffle_seed is not None:
-        shuffle_seed = args.dataset_shuffle_seed
-    return df.sample(frac=1, random_state=shuffle_seed).reset_index(drop=True)
+    if not args.curate_dataset:
+        # Sample so the LLM doesn't see sequential rows of data 100% of the time
+        # Use very first seed to guarantee replicability of the results, unless
+        # the user gave a particular seed for shuffling (ie: re-investigating a
+        # later seed without running the former seed(s))
+        return df.sample(frac=1, random_state=args.dataset_shuffle_seed).reset_index(drop=True)
+    # Don't shuffle when curating, sort by non-objective and non-class columns instead
+    return df.sort_values(by=[_ for _ in df.columns if _ not in set(args.objective_columns+[args.class_column])]).reset_index(drop=True)
 
 def llm_template(df, objective_columns=None, with_answer=False, with_query_answer=False, scientific=False):
     """
@@ -203,6 +207,7 @@ Only provide a new performance value for configurations that the user gives you 
         eval_bools[0] = np.logical_and(eval_bools[0], eval_bools[1])
     eval_conditions = eval_bools[0]
     used_icl, used_eval = [], []
+    rng = np.random.default_rng(args.dataset_shuffle_seed)
     for _round in range(args.n_rounds):
         # Select data independently between rounds
         icl_eligible = index_selector[icl_conditions].index.to_numpy()
@@ -235,13 +240,79 @@ f"""Please provide {quantity_word} candidate responses for each requested comple
 """
         )
         # ICL selection
-        used_icl.extend([_ for _ in icl_eligible[:args.n_ICL]])
-        usr_prompt += llm_template(df.loc[icl_eligible[:args.n_ICL]],
+        if args.curate_dataset:
+            selections = []
+            # Try to pick some ICL values that are minimally different, including
+            # room for eval values if possible
+            # Basis can be totally random, but use dataset-seed to ensure its replicable
+            selections.append(rng.choice(icl_eligible,size=1,replace=False)[0])
+            param_cols = np.asarray([_ for _ in df.columns if (_ not in args.objective_columns) and (_ != args.class_column)])
+            if 'syr2k' in str(args.dataset_dir):
+                # Apply known useful sorting order (least->most importance)
+                if 'SM' in args.ICL_classes:
+                    param_cols = param_cols[[3,4,1,5,0,2]]
+                elif 'XL' in args.ICL_classes:
+                    param_cols = param_cols[[3,4,5,1,2,0]]
+            #if len(used_icl) != 0:
+            # We may try to pick something different from previous selections
+            # Vary the rest of ICL and eval budget by small edit-distance on least-important
+            permute_columns = [0]
+            permute_edit_column = 0
+            class_selector = 0
+            selection_mia = 0
+            while len(selections) < (args.n_ICL+args.n_eval):
+                if selection_mia == (len(param_cols)*len(permute_columns)):
+                    # N-edit distance is exhausted, go to N+1-edit distance
+                    avail_columns = [_ for _ in range(len(param_cols)) if _ not in permute_columns]
+                    permute_columns.append(avail_columns[0])
+                    # I'm not checking if this is necessary, but don't make everything editable immediately
+                    selection_mia = 0
+                exact_values = df.loc[selections[0],param_cols[permute_columns]]
+                fixed_cols = param_cols[[_ for _ in range(len(param_cols)) if _ not in permute_columns]]
+                no_edits = df.loc[selections[0],fixed_cols].to_list()
+                fixed_cols = [args.class_column] + fixed_cols.tolist()
+                if len(selections) < args.n_ICL:
+                    no_edits = tuple([args.ICL_classes[class_selector % len(args.ICL_classes)]]+no_edits)
+                else:
+                    no_edits = tuple([args.eval_classes[class_selector % len(args.eval_classes)]]+no_edits)
+                find_no_edits = np.where((df[fixed_cols] == no_edits).sum(axis=1) == len(no_edits))[0]
+                # Original value and previously used may be present here
+                find_no_edits = [_ for _ in find_no_edits if _ not in selections]
+                if len(selections) < args.n_ICL:
+                    # Trim across rounds
+                    find_no_edits = [_ for _ in find_no_edits if _ in icl_eligible]
+                    if len(find_no_edits) > 0:
+                        selections.append(find_no_edits[0])
+                        selection_mia = 0
+                    else:
+                        selection_mia += 1
+                else:
+                    # Trim across rounds
+                    find_no_edits = [_ for _ in find_no_edits if _ in eval_eligible]
+                    if len(find_no_edits) > 0:
+                        selections.append(find_no_edits[0])
+                        selection_mia = 0
+                    else:
+                        selection_mia += 1
+                # Cycle edit attempts
+                permute_edit_column = (permute_edit_column + 1) % len(permute_columns)
+                permute_columns[permute_edit_column] = (permute_columns[permute_edit_column] + 1) % len(param_cols)
+                class_selector += 1
+            selected = selections[:args.n_ICL]
+            # Trim eligiblity
+            icl_eligible = [_ for _ in icl_eligible if _ not in selections]
+            eval_eligible = [_ for _ in eval_eligible if _ not in selections]
+        else:
+            selected = icl_eligible[:args.n_ICL]
+            # Trim eligible
+            icl_eligible = icl_eligible[args.n_ICL:]
+        used_icl.extend([_ for _ in selected])
+        usr_prompt += llm_template(df.loc[selected],
                                   objective_columns=args.objective_columns,
                                   with_answer=True, scientific=args.scientific_notation)
-        prompt_objective = df.loc[icl_eligible[:args.n_ICL],args.objective_columns]
+        prompt_objective = df.loc[selected,args.objective_columns]
         # Drop any ICL eligible items that are INCLUDED in ICL prior to picking evaluations
-        dropped_evals = set(eval_eligible).intersection(set(icl_eligible[:args.n_ICL]))
+        dropped_evals = set(eval_eligible).intersection(set(selected))
         if len(dropped_evals) > 0:
             best_eval_idx = [_ for _ in best_eval_idx if _ not in dropped_evals]
             eval_eligible = [_ for _ in eval_eligible if _ not in dropped_evals]
@@ -249,8 +320,14 @@ f"""Please provide {quantity_word} candidate responses for each requested comple
 """Please complete the following:
 """
         )
-        used_eval.extend([_ for _ in eval_eligible[:args.n_eval]])
-        usr_prompt += llm_template(df.loc[eval_eligible[:args.n_eval]],
+        # EVAL selection
+        if args.curate_dataset:
+            selected = selections[args.n_ICL:]
+        else:
+            selected = eval_eligible[:args.n_eval]
+            eval_eligible = eval_eligible[args.n_eval:]
+        used_eval.extend([_ for _ in selected])
+        usr_prompt += llm_template(df.loc[selected],
                                    objective_columns=args.objective_columns,
                                    with_query_answer=True, scientific=args.scientific_notation)
         usr_prompt = "\n".join(usr_prompt)
@@ -263,7 +340,7 @@ f"""Please provide {quantity_word} candidate responses for each requested comple
             optimal_results = df.loc[best_eval_idx]
         else:
             # Best results are based on MAE/MSE vs ground truth
-            optimal_results = df.loc[eval_eligible[:args.n_eval]]
+            optimal_results = df.loc[selected]
         rounds.append([prompts, prompt_objective, optimal_results])
     return rounds
 
@@ -443,7 +520,7 @@ def maybe_cached(model, seed, roundidx, td, to_model, cache, cache_key, args, ig
             # Not caught: og_text, og_response_possibilities, og_logits
             (text, response_possibilities, logits, *_) = cache[cache_key]
             del _
-            return model, text, response_possibilities, logits
+            return model, text, response_possibilities, logits, True
     if model is None:
         model = HF_Interface(args.model_name)
     model.set_seed(seed)
@@ -465,7 +542,7 @@ def maybe_cached(model, seed, roundidx, td, to_model, cache, cache_key, args, ig
         cache[cache_key] = (text, response_possibilities, logits,
                             og_text, og_response_possibilities, og_logits)
         cache.to_pickle()
-    return model, text, response_possibilities, logits
+    return model, text, response_possibilities, logits, False
 
 def request_retry(instructions=None):
     ite = text_trimmer("Mark anywhere to retry")
@@ -518,7 +595,7 @@ def main():
         if args.show_prompts:
             print(f"System Prompt: {prompts[0]['content']}")
             print(f"User Prompt: {prompts[1]['content']}")
-        print(f"Ground Truth:")
+        print(f"Round {roundidx+1}/{args.n_rounds} Ground Truth:")
         print(optimal_results)
         to_model = [prompts,
                     args.gen_config,
@@ -539,7 +616,7 @@ def main():
                 if cached:
                     td.reopen(td_loop_key)
                 td[td_loop_key]
-                model, text, response_possibilities, logits = maybe_cached(model,
+                model, text, response_possibilities, logits, from_cache = maybe_cached(model,
                                                                            seed,
                                                                            roundidx,
                                                                            td,
@@ -554,29 +631,33 @@ def main():
                 # if not validated and we'll try again. Do nothing to fall
                 # through and validate/exit the infinite loop
                 if text is None:
+                    td[td_loop_key]
+                    if from_cache:
+                        # Don't re-validate
+                        break
+                    # If you can ask, ask user
                     if args.in_text_editing:
-                        td[td_loop_key]
                         if request_retry("LLM did not produce a response"):
                             continue
                         else:
                             break
                     else:
                         print("No response from LLM")
-                        td[td_loop_key]
                         break
                 if args.response_type == 'quantitative' and args.response_format == 'performance':
                     try:
                         gen_number = float(text)
                     except:
+                        td[td_loop_key]
                         if args.in_text_editing:
-                            td[td_loop_key]
+                            if from_cache:
+                                break
                             if request_retry(f"LLM did not produce a number: '{text}'"):
                                 continue
                             else:
                                 break
                         else:
                             print("No number from LLM")
-                            td[td_loop_key]
                             break
                 td[td_loop_key]
                 validated = True
