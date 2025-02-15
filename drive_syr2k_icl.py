@@ -2,6 +2,7 @@
 import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
+import seaborn as sns
 import numpy as np
 
 # Local package dependency
@@ -97,6 +98,8 @@ def extend_build(prs):
                      help=f"Only explore variations in highest variable tokens {dhelp}")
     analysis_settings.add_argument('--haystack-error', default=None, action='append', type=float, nargs="*",
                      help=f"Error bound (as ratios) for a 'needle' generated value to be 'pickable' in the 'haystack' of generable numbers {dhelp}")
+    analysis_settings.add_argument('--no-timing-output', action='store_true',
+                     help=f"Don't update timings in the cache {dhelp}")
     return prs
 
 def extend_prs(args):
@@ -582,12 +585,17 @@ def main():
     td['make_prompts']
     errors = []
     rel_errors = []
+    clt_rel_errors = []
     copied = []
     possibly_copied = []
     n_haystack = []
+    markers = ['P','x','^']
+    color_cycler = plt.rcParams['axes.prop_cycle']
+    colors = [color_cycler.by_key()['color'][i] for i in range(len(args.seeds))]
     for (roundidx, _round) in enumerate(rounds):
         td_round_key = ('round',f'Round: {roundidx}')
         td[td_round_key]
+        dummy_lines = list(args.seeds)
         prompts, icl_values, optimal_results = _round
         if roundidx in args.skip_rounds:
             td[td_round_key]
@@ -603,6 +611,7 @@ def main():
                    ]
         fig, ax = None, None
         llm_min, llm_max = None, None
+        use_log = False
         if args.response_type == 'quantitative':
             llm_min, llm_max = [_.item() for _ in optimal_results.loc[optimal_results.index[0], args.objective_columns]]*2
         for seed in args.seeds:
@@ -634,6 +643,7 @@ def main():
                     td[td_loop_key]
                     if from_cache:
                         # Don't re-validate
+                        print(f"Cached value for round {roundidx} seed {seed} was non-response")
                         break
                     # If you can ask, ask user
                     if args.in_text_editing:
@@ -651,6 +661,7 @@ def main():
                         td[td_loop_key]
                         if args.in_text_editing:
                             if from_cache:
+                                print(f"Cached value for round {roundidx} seed {seed} was non-numeric response: {text}")
                                 break
                             if request_retry(f"LLM did not produce a number: '{text}'"):
                                 continue
@@ -688,10 +699,22 @@ def main():
                         quantity_cache.to_pickle()
                     else:
                         generable_numbers, weight = quantity_cache[cache_key]
+                        n_possibilities = list(map(lambda x: max(map(len,x)),response_possibilities))
+                        total_poss = np.prod(n_possibilities)
+                        print(f"Cached N_possibilities per token = {n_possibilities} (total={total_poss})")
                 td[td_number_field_key]
+                # Decide if log-scale is now appropriate for the plot
+                if max(generable_numbers)-min(generable_numbers) > 25:
+                    use_log = True
+                clt_rel_error = (optimal_number-generable_numbers)/optimal_number
+                clt_rel_errors.append((clt_rel_error.mean(), clt_rel_error.std()))
                 normalized_weight = np.asarray(weight).ravel()
-                normalized_weight -= min(normalized_weight)
-                normalized_weight /= max(normalized_weight)
+                if len(normalized_weight) == 1:
+                    # Sometimes the LLM only generates one number
+                    normalized_weight = np.asarray([1.])
+                else:
+                    normalized_weight -= min(normalized_weight)
+                    normalized_weight /= max(normalized_weight)
                 generable_numbers = np.asarray(generable_numbers).ravel()
                 if args.haystack_error[0] is not None:
                     for error_bound in args.haystack_error:
@@ -720,7 +743,7 @@ def main():
                     td[td_plot_key]
                     if fig is None:
                         fig, ax = plt.subplots(figsize=(12,6))
-                        ax.set_xlabel("Number generated")
+                        ax.set_xlabel("Generated Number")
                         ax.set_ylabel("Normalized likelihood of text generation")
                         # Plot ICL as vlines
                         ax.vlines(icl_values.to_numpy().ravel(), ymin=0.0, ymax=1.0,
@@ -729,12 +752,10 @@ def main():
                         # Plot Ground Truth
                         ax.vlines(optimal_results.loc[optimal_results.index[0], args.objective_columns],
                                   ymin=0.0, ymax=1.0, color='y',
-                                  zorder=0, label=f"Ground truth seed {seed}")
+                                  zorder=0, label=f"Ground Truth")
+                        # X marks the spot
                         ax.scatter(optimal_results.loc[optimal_results.index[0], args.objective_columns],
                                    0.0, marker='x', s=200, color='y', zorder=0)
-                    resps = ax.scatter(generable_numbers[sort], normalized_weight[sort],
-                                       alpha=0.6, s=4,
-                                       label=f'{args.model_name} Seed {seed}')
                     try:
                         sampled_idx = np.argwhere(generable_numbers == float(text))[0,0]
                         sampled_idx = sort.tolist().index(sampled_idx)
@@ -743,15 +764,54 @@ def main():
                         print(f"Failed to find exact sampling match, using 1.0 height default for sampled value")
                         #sampled_idx = np.argmax(normalized_weight)
                         sampled_logit = 1.0
-                    ax.scatter(float(text), sampled_logit,
-                               label=f'Sampled response {seed}', marker='+', s=400,
-                               color=resps.get_facecolor())
+                    # Add marker of sampled point
+                    sampled_dot = ax.scatter(float(text), sampled_logit,
+                                             label=f'Sampled Response for {seed}',
+                                             marker=markers[list(args.seed).index(seed) % len(markers)],
+                                             s=400,
+                                             color=colors[list(args.seeds).index(seed)],
+                                             )
+                    # Scatter everything
+                    if len(sort) < 10:
+                        ax.scatter(generable_numbers[sort], normalized_weight[sort],
+                                   #alpha=0.6, s=4,
+                                   s=32,
+                                   marker=markers[list(args.seed).index(seed) % len(markers)],
+                                   color=sampled_dot.get_facecolor(),
+                                   label=f'Distribution of Seed {seed}',
+                                   )
+                    else:
+                        ax = sns.kdeplot(x=generable_numbers[sort],
+                                    weights=normalized_weight[sort],
+                                    common_norm=False, # WE ALREADY NORMALIZED IT
+                                    ax=ax,
+                                    color=sampled_dot.get_facecolor(),
+                                    label=f'Distribution of Seed {seed}',
+                                    marker=markers[list(args.seeds).index(seed) % len(markers)],
+                                    )
+                        px,py = ax.lines[-1].get_data()
+                        if max(py) > 1.0:
+                            # Re-normalize
+                            py -= min(py)
+                            py /= max(py)
+                            ax.lines[-1].set_data(px,py)
+                            # Reset the messed up y-axes limits
+                            ax.set_ylim([0.,1.])
+                    # Indicate that the seed should be marked as plotted already
+                    dummy_lines[list(args.seeds).index(seed)] = None
                     td[td_plot_key]
                 td[td_quant_key]
             elif args.response_format == 'configuration':
                 configs = get_config_search(text, dataset)
                 print(configs)
         if not args.no_plot:
+            # Dummy lines
+            for (dummy,seed) in zip(dummy_lines, args.seeds):
+                if dummy is not None:
+                    dummy_line = ax.plot([],[], color=colors[list(args.seeds).index(seed)],
+                                         label=f"Seed {seed} -- No numeric response")
+            if use_log:
+                ax.set_xscale('log')
             if args.title is not None:
                 ax.set_title(args.title)
             if args.llm_range_only:
@@ -776,13 +836,16 @@ def main():
     print("\t"+f"MAE: {np.mean(np.abs(errors))}")
     print("\t"+f"MSE: {np.mean(np.asarray(errors)**2)}")
     print(f"As relative ratio errors:")
-    print("\t"+f"MAE: {np.mean(np.abs(rel_errors))}")
-    print("\t"+f"MSE: {np.mean(np.asarray(rel_errors)**2)}")
+    print("\t"+f"MARE: {np.mean(np.abs(rel_errors))}")
+    print("\t"+f"MSRE: {np.mean(np.asarray(rel_errors)**2)}")
+    print("FOR CLT: ALL OF THESE POINTS MUST BE ADDED TO THE DISTRIBUTIONS (mean, stddev)")
+    print("\n".join([f"CLT_Mean: {_[0]}, CLT_STD: {_[1]}" for _ in clt_rel_errors]))
+    print(f"CLT_GEN_Mean: {np.asarray(rel_errors).mean()}, CLT_GEN_STD: {np.asarray(rel_errors).std()}")
     print(f"# Copied answers: {np.sum(copied)}")
     print(f"# Possible Copied answers: {np.sum(possibly_copied)}")
     td['all_runtime']
     print(td.dump())
-    if llm_cache is not None:
+    if llm_cache is not None and not args.no_timing_output:
         import datetime
         now = datetime.datetime.now()
         llm_cache[f"Arguments for execution @ {now}"] = args

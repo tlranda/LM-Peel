@@ -2,11 +2,12 @@
 
 n_icl=( 1 5 10 50 100 );
 icl_f=( "001" "005" "010" "050" "100" );
-size="XL";
-curated="curated_";
+cache_loc="Caches"; #"/tmp/LMP_Caches";
 
 # Set parallel in environment
 export TOKENIZERS_PARALLELISM=true;
+for size in "SM" "XL" ; do
+for curated in "" "curated_"; do
 for i in "${!icl_f[@]}"; do
     trythis=("python3 drive_syr2k_icl.py "
              # -- DISTRIBUTION EXPLORATION --
@@ -15,7 +16,7 @@ for i in "${!icl_f[@]}"; do
 
              # -- DATA HANDLING --
              "--dataset-dir Datasets/syr2k "
-             "--curate-dataset " # WHEN DISABLED, ALSO edit curated variable above to ""
+             # --HANDLED BASED ON CURATION BELOW-- "--curate-dataset "
              # --disable-- "--dataset-shuffle-seed 1234 "
              "--class-column size "
              "--ICL-classes ${size} --eval-classes ${size} "
@@ -42,8 +43,8 @@ for i in "${!icl_f[@]}"; do
 
              # -- HANDLE LLM RESPONSES --
              # Recall previously answered / pruned values so we don't waste LLM usage
-             "--llm-cache Caches/${curated}syr2k_${size}.pkl "
-             "--quantity-cache Caches/${curated}number_fields_syr2k_${size}.pkl "
+             "--llm-cache ${cache_loc}/${curated}syr2k_${size}.pkl "
+             "--quantity-cache ${cache_loc}/${curated}number_fields_syr2k_${size}.pkl "
              # Use the ITE module
              "--in-text-editing "
 
@@ -55,14 +56,20 @@ for i in "${!icl_f[@]}"; do
              "--override "
 
              # -- ANALYSIS SETTINGS --
-             "--haystack-error 0.001 0.01 0.1 0.25 0.5 "
+             # --disable-- "--haystack-error 0.001 0.01 0.1 0.25 0.5 "
              # --disable-- "--highest-variation-only "
+             "--no-timing-output "
          );
+    if [[ "${curated}" != "" ]]; then
+        trythis=( ${trythis[@]} "--curate-dataset " );
+    fi
     trythis="${trythis[*]}";
     echo "${trythis}";
     eval "${trythis}";
     if [ $? -ne 0 ]; then
         exit;
     fi;
+done;
+done;
 done;
 
