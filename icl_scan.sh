@@ -50,18 +50,19 @@ for i in "${!icl_f[@]}"; do
 
              # -- PLOT SETTINGS --
              "--no-plot "
-             "--title \"Polybench ${size} Syr2k Prediction with ${n_icl[$i]} ICL Examples\""
              "--export Figures/${curated}syr2k_${size}_${icl_f[$i]}.png "
              "--llm-range-only "
              "--override "
 
              # -- ANALYSIS SETTINGS --
-             # --disable-- "--haystack-error 0.001 0.01 0.1 0.25 0.5 "
+             "--haystack-error 0.001 0.01 0.1 0.25 0.5 "
              # --disable-- "--highest-variation-only "
              "--no-timing-output "
          );
     if [[ "${curated}" != "" ]]; then
-        trythis=( ${trythis[@]} "--curate-dataset " );
+        trythis=( ${trythis[@]} "--curate-dataset --title \"Curated Polybench/C Syr2k ${size} Prediction with ${n_icl[$i]} ICL Examples\"" );
+    else
+        trythis=( ${trythis[@]} "--title \"Polybench/C Syr2k ${size} Prediction with ${n_icl[$i]} ICL Examples\"" );
     fi
     trythis="${trythis[*]}";
     echo "${trythis}";

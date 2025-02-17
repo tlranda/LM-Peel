@@ -1,0 +1,34 @@
+This project utilizes Python3's Pickle library for caches.
+Pickle is NOT a secure protocol and it is not safe to unpickle unknown objects.
+
+You do not have to utilize the artifact's provided Pickle caches and can simply
+comment out the associated lines in `icl_scan.sh` or not provide the arguments
+when directly running the `drive_syr2k_icl.py` script.
+
+Without the LLM cache, the script will need to run the transformer model and
+interactively edit responses.
+Without the number field cache, the script will need to manually reconstruct
+all possible strings from LLM responses.
+The caches are provided as a convenience for replicating the work in a timely
+manner and to facilitate explorations of the provided codebase.
+They are not required and can be safely excluded using the process outlined in
+the previous paragraph.
+
+If you DO intend to utilize the provided Pickle caches, please verify their
+authenticity using the following SHA256 hashes:
+
+b850683ef482b16ea7a6a22826c140d9775777a3e4832cea74efea3770069563  Caches/curated_number_fields_syr2k_SM.pkl
+c1d7c5835f76898cf379846e03e1a4f6cba06a1662424e0c70af61e654f8aafe  Caches/curated_number_fields_syr2k_XL.pkl
+02865d842e534f08cf57edd7797bc35f4601176743eb34acafb48b5c1a549c11  Caches/curated_syr2k_SM.pkl
+43105d4cd340276dc757d630b9046048ff4c32f53001a2f703ecb777f00b0b58  Caches/curated_syr2k_XL.pkl
+08fbdeae329dac76eb84b657d922dd5bf15e5f78a82cf6ee839e5eb8c5244bd4  Caches/number_fields_syr2k_SM.pkl
+7cf91df32a2803e2ff8ac53763923f14b2d596ea6f49460b45c2d4dee457cfe3  Caches/number_fields_syr2k_XL.pkl
+1ce5df3daabbe88f372ffb90e3b0cfccb0b6f7e2ccc5314aa17d843ff1180b7f  Caches/syr2k_SM.pkl
+7230eaedf0d719be7747f74118081f3c3452c773c6f39d40be669132c3efccc3  Caches/syr2k_XL.pkl
+
+This output should be produced character-for-character by running:
+sha256sum Caches/*.pkl
+
+If there are any differences, DO NOT utilize the cache and report the issue to
+appropriate persons.
+

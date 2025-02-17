@@ -4,6 +4,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
+from sklearn.metrics import r2_score
 
 # Local package dependency
 from peeled_huggingface import HF_Interface, build, parse
@@ -16,6 +17,9 @@ import itertools
 import multiprocessing
 import pathlib
 import time
+
+titlefontsize = 18
+fontsize=16
 
 def extend_build(prs):
     """
@@ -586,9 +590,11 @@ def main():
     errors = []
     rel_errors = []
     clt_rel_errors = []
+    clt_mean_median_errors = []
     copied = []
     possibly_copied = []
     n_haystack = []
+    true_num_vs_gen_num = []
     markers = ['P','x','^']
     color_cycler = plt.rcParams['axes.prop_cycle']
     colors = [color_cycler.by_key()['color'][i] for i in range(len(args.seeds))]
@@ -685,6 +691,7 @@ def main():
                 if llm_max < gen_number:
                     llm_max = gen_number
                 optimal_number = optimal_results.loc[optimal_results.index[0], args.objective_columns].item()
+                true_num_vs_gen_num.append((optimal_number, gen_number))
                 errors.append(optimal_number-gen_number)
                 rel_errors.append((optimal_number-gen_number)/optimal_number)
                 copied.append(gen_number in icl_values.to_numpy())
@@ -701,13 +708,17 @@ def main():
                         generable_numbers, weight = quantity_cache[cache_key]
                         n_possibilities = list(map(lambda x: max(map(len,x)),response_possibilities))
                         total_poss = np.prod(n_possibilities)
-                        print(f"Cached N_possibilities per token = {n_possibilities} (total={total_poss})")
+                        print(f"Class {args.eval_classes} n-ICL {len(icl_values)} round {roundidx} seed {seed} cached N_possibilities per token = {n_possibilities} (total={total_poss})")
                 td[td_number_field_key]
+                generable_numbers = np.asarray(generable_numbers).ravel()
                 # Decide if log-scale is now appropriate for the plot
                 if max(generable_numbers)-min(generable_numbers) > 25:
                     use_log = True
                 clt_rel_error = (optimal_number-generable_numbers)/optimal_number
                 clt_rel_errors.append((clt_rel_error.mean(), clt_rel_error.std()))
+                clt_mean_median_errors.append(((optimal_number-generable_numbers.mean())/optimal_number, # Mean
+                                               (optimal_number-np.median(generable_numbers))/optimal_number, # Median
+                                               ))
                 normalized_weight = np.asarray(weight).ravel()
                 if len(normalized_weight) == 1:
                     # Sometimes the LLM only generates one number
@@ -715,7 +726,6 @@ def main():
                 else:
                     normalized_weight -= min(normalized_weight)
                     normalized_weight /= max(normalized_weight)
-                generable_numbers = np.asarray(generable_numbers).ravel()
                 if args.haystack_error[0] is not None:
                     for error_bound in args.haystack_error:
                         n_haystack.append(len(np.where((np.abs(optimal_number-generable_numbers)/optimal_number) <= error_bound)[0]))
@@ -743,8 +753,8 @@ def main():
                     td[td_plot_key]
                     if fig is None:
                         fig, ax = plt.subplots(figsize=(12,6))
-                        ax.set_xlabel("Generated Number")
-                        ax.set_ylabel("Normalized likelihood of text generation")
+                        ax.set_xlabel("Generated Number", fontsize=fontsize)
+                        ax.set_ylabel("Normalized likelihood of text generation", fontsize=fontsize)
                         # Plot ICL as vlines
                         ax.vlines(icl_values.to_numpy().ravel(), ymin=0.0, ymax=1.0,
                                   alpha=0.5, color='k', zorder=-1,
@@ -755,7 +765,7 @@ def main():
                                   zorder=0, label=f"Ground Truth")
                         # X marks the spot
                         ax.scatter(optimal_results.loc[optimal_results.index[0], args.objective_columns],
-                                   0.0, marker='x', s=200, color='y', zorder=0)
+                                   0.0, marker='X', s=200, color='y', zorder=0)
                     try:
                         sampled_idx = np.argwhere(generable_numbers == float(text))[0,0]
                         sampled_idx = sort.tolist().index(sampled_idx)
@@ -765,10 +775,14 @@ def main():
                         #sampled_idx = np.argmax(normalized_weight)
                         sampled_logit = 1.0
                     # Add marker of sampled point
+                    sample_marker = markers[list(args.seeds).index(seed) % len(markers)]
+                    if sample_marker == 'x':
+                        # Make it bold to match the others
+                        sample_marker = 'X'
                     sampled_dot = ax.scatter(float(text), sampled_logit,
                                              label=f'Sampled Response for {seed}',
-                                             marker=markers[list(args.seed).index(seed) % len(markers)],
-                                             s=400,
+                                             marker=sample_marker,
+                                             s=200,
                                              color=colors[list(args.seeds).index(seed)],
                                              )
                     # Scatter everything
@@ -776,7 +790,7 @@ def main():
                         ax.scatter(generable_numbers[sort], normalized_weight[sort],
                                    #alpha=0.6, s=4,
                                    s=32,
-                                   marker=markers[list(args.seed).index(seed) % len(markers)],
+                                   marker=markers[list(args.seeds).index(seed) % len(markers)],
                                    color=sampled_dot.get_facecolor(),
                                    label=f'Distribution of Seed {seed}',
                                    )
@@ -810,13 +824,17 @@ def main():
                 if dummy is not None:
                     dummy_line = ax.plot([],[], color=colors[list(args.seeds).index(seed)],
                                          label=f"Seed {seed} -- No numeric response")
-            if use_log:
-                ax.set_xscale('log')
-            if args.title is not None:
-                ax.set_title(args.title)
+            # Make params legible
+            ax.tick_params(axis="x", labelsize=fontsize)
+            ax.tick_params(axis="y", labelsize=fontsize)
             if args.llm_range_only:
                 ax.set_xlim((0.95*llm_min, 1.05*llm_max))
-            ax.legend(loc='best')
+            if use_log:
+                ax.set_xscale('log')
+                ax.set_xlim([llm_min, llm_max])
+            if args.title is not None:
+                ax.set_title(args.title, fontsize=titlefontsize)
+            ax.legend(loc='best', fontsize=fontsize)
             fig.set_tight_layout(True)
             if args.export is None:
                 plt.show()
@@ -838,9 +856,11 @@ def main():
     print(f"As relative ratio errors:")
     print("\t"+f"MARE: {np.mean(np.abs(rel_errors))}")
     print("\t"+f"MSRE: {np.mean(np.asarray(rel_errors)**2)}")
+    print(f"R2 Score: {r2_score([_[0] for _ in true_num_vs_gen_num], [_[1] for _ in true_num_vs_gen_num])}")
     print("FOR CLT: ALL OF THESE POINTS MUST BE ADDED TO THE DISTRIBUTIONS (mean, stddev)")
     print("\n".join([f"CLT_Mean: {_[0]}, CLT_STD: {_[1]}" for _ in clt_rel_errors]))
     print(f"CLT_GEN_Mean: {np.asarray(rel_errors).mean()}, CLT_GEN_STD: {np.asarray(rel_errors).std()}")
+    print("\n".join([f"CLT_MEAN_Mean: {_[0]}, CLT_MEDIAN_Mean: {_[1]}" for _ in clt_mean_median_errors]))
     print(f"# Copied answers: {np.sum(copied)}")
     print(f"# Possible Copied answers: {np.sum(possibly_copied)}")
     td['all_runtime']
