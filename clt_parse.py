@@ -10,8 +10,6 @@ def build():
     prs = argparse.ArgumentParser()
     prs.add_argument("filename", type=pathlib.Path,
                      help="File to parse")
-    prs.add_argument('--export', type=pathlib.Path, default=None,
-                     help="Filename to save figure to (if not given, show plot)")
     return prs
 
 def parse(args=None, prs=None):
