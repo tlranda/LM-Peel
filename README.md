@@ -1,7 +1,7 @@
 # LM Peel
 
 A deeper understanding of language model behaviors, especially as related to numeric generation.
-Pre-publication work.
+This work corresponds to the IPDPS 2025 Workshop HPAI4S paper, "Is In-Context Learning Feasible for HPC Performance Autotuning?" by Thomas Randall, Akhilesh Bondapalli, Rong Ge and Prasanna Balaprakash.
 
 ## Setup
 
@@ -17,7 +17,9 @@ To download and install this model for your own use, please consult the [Hugging
 
 ### Artifacts
 
-The artifacts used to supplement the code in this repository will be added after the paper's publication.
+To assist in replication and extension of our work, we provide dataset artifacts via Zenodo [https://doi.org/10.5281/zenodo.14878735](https://doi.org/10.5281/zenodo.14878735).
+These artifacts include the preprocessed LLM generations, response editing, and numeric generation associated with the paper experiments.
+They are not strictly required to replicate the work, but can greatly accelerate the process.
 
 ## Repository Organization
 
